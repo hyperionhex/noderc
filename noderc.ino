@@ -1,75 +1,116 @@
 /*
   =====================================================================
-        ROBUST LOW-LATENCY WIFI RC CAR
-        NodeMCU ESP8266 + L298N + 2 TT Motors + Front Caster
+      RC CAR PRO - ROBUST WiFi VERSION
+      NodeMCU ESP8266 + L298N + 2 Yellow TT Motors + Front Caster
   =====================================================================
 
+  DIRECT CONNECTION
+  -----------------
   WiFi:
-      SSID     : RC_Car
-      Password : 12345678
+      RC_Car
 
-  Controller:
+  Password:
+      12345678
+
+  Open:
       http://192.168.4.1
 
-  REQUIRED LIBRARY:
-      WebSockets by Markus Sattler
+
+  OPTIONAL HOME WIFI
+  ------------------
+  Press "HOME WIFI" in the Web UI.
+
+  Enter:
+      WiFi SSID
+      WiFi Password
+
+  Once connected:
+      http://rccar.local
+
+  IMPORTANT:
+  RC_Car AP always remains the recovery network.
+
 
   =====================================================================
   WIRING
   =====================================================================
 
-  NodeMCU ESP8266            L298N
-  ---------------------------------------
-  D1 / GPIO5      -------->  IN1
-  D2 / GPIO4      -------->  IN2
+  NodeMCU              L298N
+  ----------------------------------
+  D1 / GPIO5    ---->  IN1
+  D2 / GPIO4    ---->  IN2
 
-  D5 / GPIO14     -------->  IN3
-  D6 / GPIO12     -------->  IN4
+  D5 / GPIO14   ---->  IN3
+  D6 / GPIO12   ---->  IN4
 
-  D7 / GPIO13     -------->  ENA
-  D0 / GPIO16     -------->  ENB
+  D7 / GPIO13   ---->  ENA
+  D0 / GPIO16   ---->  ENB
 
-  GND             -------->  GND
-  VIN             <--------  L298N 5V
+  GND           ---->  GND
+  VIN           <----  L298N 5V
+
 
   REMOVE:
       ENA jumper
       ENB jumper
 
-  KEEP:
-      L298N 5V regulator jumper if powering NodeMCU from L298N 5V.
 
-  Motor A:
-      OUT1 + OUT2 -> Left motor
+  MOTORS:
+      OUT1 + OUT2 -> Left TT motor
+      OUT3 + OUT4 -> Right TT motor
 
-  Motor B:
-      OUT3 + OUT4 -> Right motor
 
-  Battery:
-      2S Lithium positive -> L298N +12V / VIN
-      2S Lithium negative -> L298N GND
+  BATTERY:
+      2S + -> L298N VIN / +12V
+      2S - -> L298N GND
+
+
+  =====================================================================
+  REQUIRED LIBRARY
+  =====================================================================
+
+  Arduino Library Manager:
+
+      WebSockets
+      by Markus Sattler
 
   =====================================================================
 */
 
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <WebSocketsServer.h>
 #include <EEPROM.h>
+#include <stddef.h>
 
 
 // =====================================================================
-// WIFI
+// BASIC WIFI
 // =====================================================================
 
 const char* AP_SSID = "RC_Car";
-const char* AP_PASS = "12345678";
+const char* AP_PASSWORD = "12345678";
 
-IPAddress AP_IP(192, 168, 4, 1);
-IPAddress AP_GATEWAY(192, 168, 4, 1);
-IPAddress AP_SUBNET(255, 255, 255, 0);
+const char* MDNS_HOST = "rccar";
+
+
+IPAddress AP_IP(
+  192, 168, 4, 1
+);
+
+IPAddress AP_GATEWAY(
+  192, 168, 4, 1
+);
+
+IPAddress AP_SUBNET(
+  255, 255, 255, 0
+);
+
 
 ESP8266WebServer server(80);
+
 WebSocketsServer webSocket(81);
 
 
@@ -77,106 +118,168 @@ WebSocketsServer webSocket(81);
 // MOTOR PINS
 // =====================================================================
 
-// LEFT MOTOR
 #define IN1 D1
 #define IN2 D2
 #define ENA D7
 
-// RIGHT MOTOR
 #define IN3 D5
 #define IN4 D6
 #define ENB D0
 
 
 // =====================================================================
-// EEPROM
+// PERSISTENT CONFIGURATION
 // =====================================================================
 
-#define EEPROM_SIZE       16
-#define EEPROM_MAGIC_ADDR 0
-#define EEPROM_CH_ADDR    1
-#define EEPROM_MAGIC      0xA7
+#define EEPROM_SIZE 192
+
+#define CONFIG_MAGIC   0x52434334UL
+#define CONFIG_VERSION 1
+
+
+struct PersistentConfig
+{
+  uint32_t magic;
+
+  uint16_t version;
+
+  uint8_t apChannel;
+
+  uint8_t homeConfigured;
+
+  char homeSSID[33];
+
+  char homePassword[65];
+
+  uint32_t checksum;
+};
+
+
+PersistentConfig persistentConfig;
+
+
+// =====================================================================
+// WIFI RADIO SETTINGS
+// =====================================================================
 
 uint8_t apChannel = 1;
-
-
-// =====================================================================
-// WIFI SETTINGS
-// =====================================================================
-
-// Adjustable from WebUI.
-//
-// Values supported in UI:
-// 8.5
-// 11
-// 14
-// 17.5
-// 20.5 dBm
 
 float wifiTxPower = 14.0;
 
 
 // =====================================================================
-// CAR SETTINGS
+// HOME WIFI STATE
+// =====================================================================
+
+bool homeTestActive = false;
+
+char testSSID[33] = {0};
+
+char testPassword[65] = {0};
+
+unsigned long homeTestStart = 0;
+
+
+bool pendingHomeConnect = false;
+
+unsigned long pendingHomeConnectAt = 0;
+
+
+bool pendingForgetHome = false;
+
+unsigned long pendingForgetAt = 0;
+
+
+bool reconnectOldHomePending = false;
+
+unsigned long reconnectOldHomeAt = 0;
+
+
+unsigned long lastSavedHomeAttempt = 0;
+
+
+bool previousHomeConnected = false;
+
+bool mdnsRunning = false;
+
+
+String homeStatusMessage =
+  "Home WiFi not configured";
+
+
+// =====================================================================
+// AP CHANNEL CHANGE STATE
+// =====================================================================
+
+bool pendingChannelChange = false;
+
+uint8_t requestedChannel = 1;
+
+unsigned long requestedChannelAt = 0;
+
+
+// =====================================================================
+// CAR CONFIG
 // =====================================================================
 
 int speedPercent = 70;
 
 int turnStrength = 70;
 
-// Straight-line calibration
-int leftTrim  = 100;
+
+int leftTrim = 100;
+
 int rightTrim = 100;
 
-// Smooth acceleration
+
+/*
+   Acceleration ramp.
+
+   Low:
+      smoother
+      less current spike
+
+   High:
+      faster response
+*/
+
 int rampStep = 10;
 
-// 0 = Pivot steering
-// 1 = Smooth steering
+
+// 0 = Pivot
+// 1 = Smooth
+
 int steeringMode = 1;
 
-// Your current physical car has reversed L/R,
-// therefore this starts enabled.
+
+/*
+   Current physical build:
+
+   LEFT previously turned RIGHT.
+
+   Keep true.
+*/
+
 bool swapSteering = true;
 
-// Battery-saving motor mode
+
 bool ecoMode = true;
 
 int ecoSpeedLimit = 85;
 
 
 // =====================================================================
-// SAFETY SETTINGS
+// FAILSAFE
 // =====================================================================
 
-// Browser heartbeat = 100 ms.
-//
-// If communication stops for >450ms,
-// motors are killed by ESP itself.
-const unsigned long CONTROL_TIMEOUT = 450;
+const unsigned long CONTROL_TIMEOUT = 700;
 
 unsigned long lastControlPacket = 0;
 
 
-// AP health check
-const unsigned long AP_CHECK_INTERVAL = 5000;
+const unsigned long AP_HEALTH_INTERVAL = 5000;
 
-unsigned long lastAPCheck = 0;
-
-
-// UI status push
-unsigned long lastStatusPush = 0;
-
-
-// =====================================================================
-// CHANNEL CHANGE
-// =====================================================================
-
-bool channelChangePending = false;
-
-uint8_t pendingChannel = 1;
-
-unsigned long channelChangeAt = 0;
+unsigned long lastAPHealthCheck = 0;
 
 
 // =====================================================================
@@ -185,96 +288,226 @@ unsigned long channelChangeAt = 0;
 
 char activeCommand = 'S';
 
+
 int currentLeft = 0;
+
 int currentRight = 0;
 
+
 int targetLeft = 0;
+
 int targetRight = 0;
+
 
 unsigned long lastRampUpdate = 0;
 
 const unsigned long RAMP_INTERVAL = 8;
 
 
-// Only one phone controls motors at a time.
-int controllerClient = -1;
+// =====================================================================
+// CHECKSUM
+// =====================================================================
+
+uint32_t calculateConfigChecksum(
+  const PersistentConfig& cfg
+)
+{
+  const uint8_t* data =
+    reinterpret_cast<const uint8_t*>(
+      &cfg
+    );
+
+
+  size_t length =
+    offsetof(
+      PersistentConfig,
+      checksum
+    );
+
+
+  uint32_t hash =
+    2166136261UL;
+
+
+  for(
+    size_t i = 0;
+    i < length;
+    i++
+  )
+  {
+    hash ^=
+      data[i];
+
+
+    hash *=
+      16777619UL;
+  }
+
+
+  return hash;
+}
 
 
 // =====================================================================
-// EEPROM FUNCTIONS
+// DEFAULT CONFIG
 // =====================================================================
 
-bool validWiFiChannel(uint8_t channel)
+void setDefaultPersistentConfig()
+{
+  memset(
+    &persistentConfig,
+    0,
+    sizeof(persistentConfig)
+  );
+
+
+  persistentConfig.magic =
+    CONFIG_MAGIC;
+
+
+  persistentConfig.version =
+    CONFIG_VERSION;
+
+
+  persistentConfig.apChannel =
+    1;
+
+
+  persistentConfig.homeConfigured =
+    0;
+
+
+  persistentConfig.checksum =
+    calculateConfigChecksum(
+      persistentConfig
+    );
+}
+
+
+// =====================================================================
+// LOAD CONFIG
+// =====================================================================
+
+void loadPersistentConfig()
+{
+  EEPROM.begin(
+    EEPROM_SIZE
+  );
+
+
+  EEPROM.get(
+    0,
+    persistentConfig
+  );
+
+
+  bool valid =
+    (
+      persistentConfig.magic
+      ==
+      CONFIG_MAGIC
+    )
+
+    &&
+
+    (
+      persistentConfig.version
+      ==
+      CONFIG_VERSION
+    )
+
+    &&
+
+    (
+         persistentConfig.apChannel == 1
+      || persistentConfig.apChannel == 6
+      || persistentConfig.apChannel == 11
+    )
+
+    &&
+
+    (
+      persistentConfig.checksum
+      ==
+      calculateConfigChecksum(
+        persistentConfig
+      )
+    );
+
+
+  if(!valid)
+  {
+    setDefaultPersistentConfig();
+
+
+    EEPROM.put(
+      0,
+      persistentConfig
+    );
+
+
+    EEPROM.commit();
+  }
+
+
+  apChannel =
+    persistentConfig.apChannel;
+}
+
+
+// =====================================================================
+// SAVE CONFIG
+// =====================================================================
+
+bool savePersistentConfig()
+{
+  persistentConfig.magic =
+    CONFIG_MAGIC;
+
+
+  persistentConfig.version =
+    CONFIG_VERSION;
+
+
+  persistentConfig.apChannel =
+    apChannel;
+
+
+  persistentConfig.checksum =
+    calculateConfigChecksum(
+      persistentConfig
+    );
+
+
+  EEPROM.put(
+    0,
+    persistentConfig
+  );
+
+
+  return EEPROM.commit();
+}
+
+
+// =====================================================================
+// IS HOME WIFI SAVED?
+// =====================================================================
+
+bool savedHomeWiFiExists()
 {
   return (
-       channel == 1
-    || channel == 6
-    || channel == 11
-  );
-}
+    persistentConfig.homeConfigured
+    ==
+    1
 
-
-void loadWiFiChannel()
-{
-  EEPROM.begin(EEPROM_SIZE);
-
-  uint8_t magic =
-    EEPROM.read(
-      EEPROM_MAGIC_ADDR
-    );
-
-  uint8_t stored =
-    EEPROM.read(
-      EEPROM_CH_ADDR
-    );
-
-
-  if (
-    magic == EEPROM_MAGIC
     &&
-    validWiFiChannel(stored)
-  )
-  {
-    apChannel = stored;
-  }
-  else
-  {
-    apChannel = 1;
-  }
-}
 
-
-void saveWiFiChannel(uint8_t channel)
-{
-  if (!validWiFiChannel(channel))
-    return;
-
-
-  // Avoid unnecessary flash writes.
-
-  if (
-    EEPROM.read(EEPROM_MAGIC_ADDR)
-      == EEPROM_MAGIC
-    &&
-    EEPROM.read(EEPROM_CH_ADDR)
-      == channel
-  )
-  {
-    return;
-  }
-
-
-  EEPROM.write(
-    EEPROM_MAGIC_ADDR,
-    EEPROM_MAGIC
+    strlen(
+      persistentConfig.homeSSID
+    )
+    >
+    0
   );
-
-  EEPROM.write(
-    EEPROM_CH_ADDR,
-    channel
-  );
-
-  EEPROM.commit();
 }
 
 
@@ -282,7 +515,9 @@ void saveWiFiChannel(uint8_t channel)
 // MOTOR HELPERS
 // =====================================================================
 
-int percentToPWM(int percent)
+int percentToPWM(
+  int percent
+)
 {
   percent =
     constrain(
@@ -290,6 +525,7 @@ int percentToPWM(int percent)
       0,
       100
     );
+
 
   return map(
     percent,
@@ -303,15 +539,21 @@ int percentToPWM(int percent)
 
 int applyTrim(
   int pwm,
-  int trimValue
+  int trim
 )
 {
-  long result =
-    ((long)pwm * trimValue)
-    / 100;
+  long output =
+    (
+      (long)pwm
+      *
+      trim
+    )
+    /
+    100;
+
 
   return constrain(
-    result,
+    output,
     -255,
     255
   );
@@ -319,10 +561,12 @@ int applyTrim(
 
 
 // =====================================================================
-// MOTOR OUTPUT
+// LEFT MOTOR
 // =====================================================================
 
-void setLeftMotor(int pwm)
+void setLeftMotor(
+  int pwm
+)
 {
   pwm =
     constrain(
@@ -332,10 +576,19 @@ void setLeftMotor(int pwm)
     );
 
 
-  if (pwm > 0)
+  if(pwm > 0)
   {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
+    digitalWrite(
+      IN1,
+      HIGH
+    );
+
+
+    digitalWrite(
+      IN2,
+      LOW
+    );
+
 
     analogWrite(
       ENA,
@@ -343,10 +596,20 @@ void setLeftMotor(int pwm)
     );
   }
 
-  else if (pwm < 0)
+
+  else if(pwm < 0)
   {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
+    digitalWrite(
+      IN1,
+      LOW
+    );
+
+
+    digitalWrite(
+      IN2,
+      HIGH
+    );
+
 
     analogWrite(
       ENA,
@@ -354,17 +617,36 @@ void setLeftMotor(int pwm)
     );
   }
 
+
   else
   {
-    analogWrite(ENA, 0);
+    analogWrite(
+      ENA,
+      0
+    );
 
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
+
+    digitalWrite(
+      IN1,
+      LOW
+    );
+
+
+    digitalWrite(
+      IN2,
+      LOW
+    );
   }
 }
 
 
-void setRightMotor(int pwm)
+// =====================================================================
+// RIGHT MOTOR
+// =====================================================================
+
+void setRightMotor(
+  int pwm
+)
 {
   pwm =
     constrain(
@@ -375,15 +657,23 @@ void setRightMotor(int pwm)
 
 
   /*
-      Right motor direction is electrically
-      reversed because the motor is physically
-      mounted opposite the left motor.
+     Right motor is mounted opposite
+     to the left motor.
   */
 
-  if (pwm > 0)
+  if(pwm > 0)
   {
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
+    digitalWrite(
+      IN3,
+      LOW
+    );
+
+
+    digitalWrite(
+      IN4,
+      HIGH
+    );
+
 
     analogWrite(
       ENB,
@@ -391,10 +681,20 @@ void setRightMotor(int pwm)
     );
   }
 
-  else if (pwm < 0)
+
+  else if(pwm < 0)
   {
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
+    digitalWrite(
+      IN3,
+      HIGH
+    );
+
+
+    digitalWrite(
+      IN4,
+      LOW
+    );
+
 
     analogWrite(
       ENB,
@@ -402,12 +702,25 @@ void setRightMotor(int pwm)
     );
   }
 
+
   else
   {
-    analogWrite(ENB, 0);
+    analogWrite(
+      ENB,
+      0
+    );
 
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, LOW);
+
+    digitalWrite(
+      IN3,
+      LOW
+    );
+
+
+    digitalWrite(
+      IN4,
+      LOW
+    );
   }
 }
 
@@ -419,28 +732,57 @@ void setRightMotor(int pwm)
 void stopCar()
 {
   targetLeft = 0;
+
   targetRight = 0;
 
+
   currentLeft = 0;
+
   currentRight = 0;
+
 
   activeCommand = 'S';
 
 
-  analogWrite(ENA, 0);
-  analogWrite(ENB, 0);
+  analogWrite(
+    ENA,
+    0
+  );
 
 
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
+  analogWrite(
+    ENB,
+    0
+  );
 
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+
+  digitalWrite(
+    IN1,
+    LOW
+  );
+
+
+  digitalWrite(
+    IN2,
+    LOW
+  );
+
+
+  digitalWrite(
+    IN3,
+    LOW
+  );
+
+
+  digitalWrite(
+    IN4,
+    LOW
+  );
 }
 
 
 // =====================================================================
-// SAFE MOTOR RAMP
+// SAFE RAMP
 // =====================================================================
 
 int rampMotor(
@@ -448,58 +790,78 @@ int rampMotor(
   int target
 )
 {
-  /*
-      Never jump immediately:
-
-          +200 -> -200
-
-      Instead:
-
-          +200
-          +150
-          +100
-          +50
-          0
-          -50
-          -100...
-
-      This reduces:
-          motor current spike
-          battery voltage sag
-          L298N stress
-          ESP8266 reset possibility
-  */
-
-
-  int temporaryTarget =
+  int safeTarget =
     target;
 
 
-  // Must reach zero before reversing
+  /*
+     Never directly reverse a motor.
 
-  if (
-       (current > 0 && target < 0)
-    || (current < 0 && target > 0)
+     +PWM -> 0 -> -PWM
+  */
+
+  if(
+       (
+         current > 0
+         &&
+         target < 0
+       )
+
+    ||
+
+       (
+         current < 0
+         &&
+         target > 0
+       )
   )
   {
-    temporaryTarget = 0;
+    safeTarget =
+      0;
   }
 
 
-  if (current < temporaryTarget)
+  if(
+    current
+    <
+    safeTarget
+  )
   {
-    current += rampStep;
+    current +=
+      rampStep;
 
-    if (current > temporaryTarget)
-      current = temporaryTarget;
+
+    if(
+      current
+      >
+      safeTarget
+    )
+    {
+      current =
+        safeTarget;
+    }
   }
 
-  else if (current > temporaryTarget)
-  {
-    current -= rampStep;
 
-    if (current < temporaryTarget)
-      current = temporaryTarget;
+  else if(
+    current
+    >
+    safeTarget
+  )
+  {
+    current -=
+      rampStep;
+
+
+    if(
+      current
+      <
+      safeTarget
+    )
+    {
+      current =
+        safeTarget;
+    }
   }
 
 
@@ -507,14 +869,20 @@ int rampMotor(
 }
 
 
-void updateMotorRamp()
+// =====================================================================
+// UPDATE MOTORS
+// =====================================================================
+
+void updateMotors()
 {
   unsigned long now =
     millis();
 
 
-  if (
-    now - lastRampUpdate
+  if(
+    now
+    -
+    lastRampUpdate
     <
     RAMP_INTERVAL
   )
@@ -523,7 +891,8 @@ void updateMotorRamp()
   }
 
 
-  lastRampUpdate = now;
+  lastRampUpdate =
+    now;
 
 
   currentLeft =
@@ -552,31 +921,40 @@ void updateMotorRamp()
 
 
 // =====================================================================
-// STEERING CORRECTION
+// LEFT / RIGHT CORRECTION
 // =====================================================================
 
-char correctSteering(char command)
+char correctSteering(
+  char command
+)
 {
-  if (!swapSteering)
+  if(!swapSteering)
+  {
     return command;
+  }
 
 
-  switch (command)
+  switch(command)
   {
     case 'L':
       return 'R';
 
+
     case 'R':
       return 'L';
+
 
     case 'G':
       return 'H';
 
+
     case 'H':
       return 'G';
 
+
     case 'I':
       return 'J';
+
 
     case 'J':
       return 'I';
@@ -588,7 +966,7 @@ char correctSteering(char command)
 
 
 // =====================================================================
-// CALCULATE MOTOR TARGET
+// DRIVE CALCULATION
 // =====================================================================
 
 void calculateDrive(
@@ -605,9 +983,7 @@ void calculateDrive(
     speedPercent;
 
 
-  // ECO motor speed limiter
-
-  if (ecoMode)
+  if(ecoMode)
   {
     actualSpeed =
       min(
@@ -624,165 +1000,173 @@ void calculateDrive(
 
 
   int inside =
-    ((long)base *
-      (100 - turnStrength))
-    / 100;
+    (
+      (long)base
+      *
+      (100 - turnStrength)
+    )
+    /
+    100;
 
 
   int pivot =
-    ((long)base *
-      turnStrength)
-    / 100;
+    (
+      (long)base
+      *
+      turnStrength
+    )
+    /
+    100;
 
 
   /*
-      Pivot turns draw considerably more current.
-
-      Limit them when ECO is enabled.
+     Reduce pivot current in ECO mode.
   */
 
-  if (ecoMode)
+  if(ecoMode)
   {
-    int maxPivot =
-      percentToPWM(65);
-
     pivot =
       min(
         pivot,
-        maxPivot
+        percentToPWM(65)
       );
   }
 
 
-  int left = 0;
-  int right = 0;
+  int left =
+    0;
 
 
-  switch (command)
+  int right =
+    0;
+
+
+  switch(command)
   {
-
-    // ---------------------------------------------------------
-    // FORWARD
-    // ---------------------------------------------------------
-
     case 'F':
 
-      left = base;
-      right = base;
+      left =
+        base;
+
+      right =
+        base;
 
       break;
 
-
-    // ---------------------------------------------------------
-    // BACKWARD
-    // ---------------------------------------------------------
 
     case 'B':
 
-      left = -base;
-      right = -base;
+      left =
+        -base;
+
+      right =
+        -base;
 
       break;
 
-
-    // ---------------------------------------------------------
-    // LEFT
-    // ---------------------------------------------------------
 
     case 'L':
 
-      if (steeringMode == 0)
+      if(
+        steeringMode
+        ==
+        0
+      )
       {
-        // Pivot
+        left =
+          -pivot;
 
-        left = -pivot;
-        right = pivot;
+
+        right =
+          pivot;
       }
 
       else
       {
-        // Smooth
+        left =
+          inside;
 
-        left = inside;
-        right = base;
+
+        right =
+          base;
       }
 
       break;
 
-
-    // ---------------------------------------------------------
-    // RIGHT
-    // ---------------------------------------------------------
 
     case 'R':
 
-      if (steeringMode == 0)
+      if(
+        steeringMode
+        ==
+        0
+      )
       {
-        left = pivot;
-        right = -pivot;
+        left =
+          pivot;
+
+
+        right =
+          -pivot;
       }
 
       else
       {
-        left = base;
-        right = inside;
+        left =
+          base;
+
+
+        right =
+          inside;
       }
 
       break;
 
 
-    // ---------------------------------------------------------
-    // FORWARD LEFT
-    // ---------------------------------------------------------
-
     case 'G':
 
-      left = inside;
-      right = base;
+      left =
+        inside;
+
+
+      right =
+        base;
 
       break;
 
-
-    // ---------------------------------------------------------
-    // FORWARD RIGHT
-    // ---------------------------------------------------------
 
     case 'H':
 
-      left = base;
-      right = inside;
+      left =
+        base;
+
+
+      right =
+        inside;
 
       break;
 
-
-    // ---------------------------------------------------------
-    // BACK LEFT
-    // ---------------------------------------------------------
 
     case 'I':
 
-      left = -inside;
-      right = -base;
+      left =
+        -inside;
+
+
+      right =
+        -base;
 
       break;
 
-
-    // ---------------------------------------------------------
-    // BACK RIGHT
-    // ---------------------------------------------------------
 
     case 'J':
 
-      left = -base;
-      right = -inside;
-
-      break;
+      left =
+        -base;
 
 
-    default:
-
-      left = 0;
-      right = 0;
+      right =
+        -inside;
 
       break;
   }
@@ -804,10 +1188,12 @@ void calculateDrive(
 
 
 // =====================================================================
-// COMMAND VALIDATION
+// VALID DRIVE COMMAND
 // =====================================================================
 
-bool validDriveCommand(char command)
+bool validDriveCommand(
+  char command
+)
 {
   return (
        command == 'F'
@@ -827,9 +1213,15 @@ bool validDriveCommand(char command)
 // DRIVE COMMAND
 // =====================================================================
 
-void driveCommand(char command)
+void driveCommand(
+  char command
+)
 {
-  if (!validDriveCommand(command))
+  if(
+    !validDriveCommand(
+      command
+    )
+  )
   {
     stopCar();
 
@@ -841,7 +1233,11 @@ void driveCommand(char command)
     millis();
 
 
-  if (command == 'S')
+  if(
+    command
+    ==
+    'S'
+  )
   {
     stopCar();
 
@@ -860,57 +1256,47 @@ void driveCommand(char command)
 
 
 // =====================================================================
-// WIFI AP
+// START / REBUILD RC_Car AP
 // =====================================================================
 
-bool createAccessPoint()
+bool startSoftAP(
+  bool stationAlsoEnabled
+)
 {
-  /*
-      Don't store WiFi configuration
-      unnecessarily in ESP flash.
-  */
-
-  WiFi.persistent(false);
+  stopCar();
 
 
-  WiFi.mode(
-    WIFI_AP
-  );
+  if(stationAlsoEnabled)
+  {
+    WiFi.mode(
+      WIFI_AP_STA
+    );
+  }
 
+  else
+  {
+    WiFi.mode(
+      WIFI_AP
+    );
+  }
 
-  /*
-      Low latency mode.
-
-      WiFi sleep intentionally disabled.
-  */
 
   WiFi.setSleepMode(
     WIFI_NONE_SLEEP
   );
 
 
-  /*
-      Force 802.11g.
-
-      More than enough throughput
-      for our tiny WebSocket packets.
-  */
-
   WiFi.setPhyMode(
     WIFI_PHY_MODE_11G
   );
 
-
-  /*
-      Adjustable from WebUI.
-  */
 
   WiFi.setOutputPower(
     wifiTxPower
   );
 
 
-  if (
+  if(
     !WiFi.softAPConfig(
       AP_IP,
       AP_GATEWAY,
@@ -922,82 +1308,637 @@ bool createAccessPoint()
   }
 
 
-  bool started =
+  bool success =
     WiFi.softAP(
       AP_SSID,
-      AP_PASS,
-
+      AP_PASSWORD,
       apChannel,
-
       false,
-
-      2
+      4
     );
 
 
-  return started;
+  return success;
 }
 
 
 // =====================================================================
-// CHANGE WIFI CHANNEL
+// MDNS
 // =====================================================================
 
-void changeWiFiChannelNow()
+void stopMDNS()
 {
-  if (!channelChangePending)
-    return;
+  if(
+    MDNS.isRunning()
+  )
+  {
+    MDNS.close();
+  }
 
 
-  if (
-    millis()
-    <
-    channelChangeAt
+  mdnsRunning =
+    false;
+}
+
+
+void startMDNS()
+{
+  if(
+    WiFi.status()
+    !=
+    WL_CONNECTED
   )
   {
     return;
   }
 
 
-  channelChangePending =
+  stopMDNS();
+
+
+  if(
+    MDNS.begin(
+      MDNS_HOST
+    )
+  )
+  {
+    MDNS.addService(
+      "http",
+      "tcp",
+      80
+    );
+
+
+    MDNS.addService(
+      "ws",
+      "tcp",
+      81
+    );
+
+
+    mdnsRunning =
+      true;
+
+
+    Serial.println(
+      "mDNS ready:"
+    );
+
+
+    Serial.println(
+      "http://rccar.local"
+    );
+  }
+}
+
+
+// =====================================================================
+// BEGIN HOME WIFI CONNECTION
+// =====================================================================
+
+void beginHomeWiFi(
+  const char* ssid,
+  const char* password
+)
+{
+  stopCar();
+
+
+  /*
+     Keep RC_Car AP alive while adding
+     station mode.
+  */
+
+  WiFi.mode(
+    WIFI_AP_STA
+  );
+
+
+  WiFi.hostname(
+    MDNS_HOST
+  );
+
+
+  WiFi.setAutoReconnect(
+    false
+  );
+
+
+  WiFi.disconnect(
+    false
+  );
+
+
+  delay(20);
+
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+
+  lastSavedHomeAttempt =
+    millis();
+}
+
+
+// =====================================================================
+// START TESTING NEW HOME WIFI
+// =====================================================================
+
+void startPendingHomeTest()
+{
+  if(
+    !pendingHomeConnect
+  )
+  {
+    return;
+  }
+
+
+  if(
+    millis()
+    <
+    pendingHomeConnectAt
+  )
+  {
+    return;
+  }
+
+
+  pendingHomeConnect =
+    false;
+
+
+  homeTestActive =
+    true;
+
+
+  homeTestStart =
+    millis();
+
+
+  homeStatusMessage =
+    "Connecting to Home WiFi...";
+
+
+  beginHomeWiFi(
+    testSSID,
+    testPassword
+  );
+}
+
+
+// =====================================================================
+// FORGET HOME WIFI
+// =====================================================================
+
+void processPendingForget()
+{
+  if(
+    !pendingForgetHome
+  )
+  {
+    return;
+  }
+
+
+  if(
+    millis()
+    <
+    pendingForgetAt
+  )
+  {
+    return;
+  }
+
+
+  pendingForgetHome =
+    false;
+
+
+  stopCar();
+
+
+  homeTestActive =
+    false;
+
+
+  reconnectOldHomePending =
+    false;
+
+
+  stopMDNS();
+
+
+  WiFi.disconnect(
+    true
+  );
+
+
+  memset(
+    persistentConfig.homeSSID,
+    0,
+    sizeof(
+      persistentConfig.homeSSID
+    )
+  );
+
+
+  memset(
+    persistentConfig.homePassword,
+    0,
+    sizeof(
+      persistentConfig.homePassword
+    )
+  );
+
+
+  persistentConfig.homeConfigured =
+    0;
+
+
+  savePersistentConfig();
+
+
+  homeStatusMessage =
+    "Home WiFi forgotten";
+
+
+  /*
+     Return to clean AP-only mode.
+  */
+
+  startSoftAP(
+    false
+  );
+}
+
+
+// =====================================================================
+// MANAGE HOME WIFI
+// =====================================================================
+
+void manageHomeWiFi()
+{
+  bool connected =
+    (
+      WiFi.status()
+      ==
+      WL_CONNECTED
+    );
+
+
+  // -----------------------------------------------------------------
+  // JUST CONNECTED
+  // -----------------------------------------------------------------
+
+  if(
+    connected
+    &&
+    !previousHomeConnected
+  )
+  {
+    previousHomeConnected =
+      true;
+
+
+    startMDNS();
+
+
+    Serial.println(
+      "Home WiFi connected"
+    );
+
+
+    Serial.print(
+      "Home IP: "
+    );
+
+
+    Serial.println(
+      WiFi.localIP()
+    );
+  }
+
+
+  // -----------------------------------------------------------------
+  // JUST DISCONNECTED
+  // -----------------------------------------------------------------
+
+  if(
+    !connected
+    &&
+    previousHomeConnected
+  )
+  {
+    previousHomeConnected =
+      false;
+
+
+    stopMDNS();
+
+
+    homeStatusMessage =
+      "Home WiFi disconnected";
+  }
+
+
+  // -----------------------------------------------------------------
+  // TEST SUCCEEDED
+  // -----------------------------------------------------------------
+
+  if(
+    connected
+    &&
+    homeTestActive
+  )
+  {
+    memset(
+      persistentConfig.homeSSID,
+      0,
+      sizeof(
+        persistentConfig.homeSSID
+      )
+    );
+
+
+    memset(
+      persistentConfig.homePassword,
+      0,
+      sizeof(
+        persistentConfig.homePassword
+      )
+    );
+
+
+    strncpy(
+      persistentConfig.homeSSID,
+      testSSID,
+      sizeof(
+        persistentConfig.homeSSID
+      )
+      -
+      1
+    );
+
+
+    strncpy(
+      persistentConfig.homePassword,
+      testPassword,
+      sizeof(
+        persistentConfig.homePassword
+      )
+      -
+      1
+    );
+
+
+    persistentConfig.homeConfigured =
+      1;
+
+
+    savePersistentConfig();
+
+
+    homeTestActive =
+      false;
+
+
+    memset(
+      testSSID,
+      0,
+      sizeof(testSSID)
+    );
+
+
+    memset(
+      testPassword,
+      0,
+      sizeof(testPassword)
+    );
+
+
+    homeStatusMessage =
+      "Connected and saved";
+
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------------
+  // NEW CREDENTIAL TEST FAILED
+  // -----------------------------------------------------------------
+
+  if(
+    homeTestActive
+    &&
+    !connected
+    &&
+    (
+      millis()
+      -
+      homeTestStart
+      >
+      18000
+    )
+  )
+  {
+    homeTestActive =
+      false;
+
+
+    WiFi.disconnect(
+      false
+    );
+
+
+    homeStatusMessage =
+      "Connection failed. RC_Car is still available.";
+
+
+    memset(
+      testSSID,
+      0,
+      sizeof(testSSID)
+    );
+
+
+    memset(
+      testPassword,
+      0,
+      sizeof(testPassword)
+    );
+
+
+    /*
+       If old saved credentials exist,
+       restore them.
+
+       Otherwise go back to AP-only mode.
+    */
+
+    if(
+      savedHomeWiFiExists()
+    )
+    {
+      reconnectOldHomePending =
+        true;
+
+
+      reconnectOldHomeAt =
+        millis()
+        +
+        1500;
+    }
+
+    else
+    {
+      startSoftAP(
+        false
+      );
+    }
+
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------------
+  // RESTORE PREVIOUS SAVED NETWORK
+  // -----------------------------------------------------------------
+
+  if(
+    reconnectOldHomePending
+    &&
+    millis()
+    >=
+    reconnectOldHomeAt
+  )
+  {
+    reconnectOldHomePending =
+      false;
+
+
+    beginHomeWiFi(
+      persistentConfig.homeSSID,
+      persistentConfig.homePassword
+    );
+
+
+    homeStatusMessage =
+      "Restoring previous Home WiFi...";
+
+
+    return;
+  }
+
+
+  // -----------------------------------------------------------------
+  // RETRY SAVED HOME WIFI
+  //
+  // Don't channel-hop while car is driving.
+  // -----------------------------------------------------------------
+
+  if(
+    !connected
+    &&
+    !homeTestActive
+    &&
+    !pendingHomeConnect
+    &&
+    savedHomeWiFiExists()
+    &&
+    activeCommand == 'S'
+    &&
+    (
+      millis()
+      -
+      lastSavedHomeAttempt
+      >
+      30000
+    )
+  )
+  {
+    beginHomeWiFi(
+      persistentConfig.homeSSID,
+      persistentConfig.homePassword
+    );
+
+
+    homeStatusMessage =
+      "Reconnecting Home WiFi...";
+  }
+}
+
+
+// =====================================================================
+// AP CHANNEL CHANGE
+// =====================================================================
+
+void processChannelChange()
+{
+  if(
+    !pendingChannelChange
+  )
+  {
+    return;
+  }
+
+
+  if(
+    millis()
+    <
+    requestedChannelAt
+  )
+  {
+    return;
+  }
+
+
+  pendingChannelChange =
     false;
 
 
   /*
-      SAFETY FIRST
+     Router owns channel when station
+     is connected.
   */
+
+  if(
+    WiFi.status()
+    ==
+    WL_CONNECTED
+  )
+  {
+    return;
+  }
+
+
+  if(
+       requestedChannel != 1
+    && requestedChannel != 6
+    && requestedChannel != 11
+  )
+  {
+    return;
+  }
+
 
   stopCar();
 
-  controllerClient = -1;
-
-
-  uint8_t newChannel =
-    pendingChannel;
-
-
-  if (!validWiFiChannel(newChannel))
-    return;
-
-
-  saveWiFiChannel(
-    newChannel
-  );
-
 
   apChannel =
-    newChannel;
+    requestedChannel;
 
 
-  Serial.println();
+  persistentConfig.apChannel =
+    apChannel;
 
-  Serial.print(
-    "Switching WiFi AP to channel "
-  );
 
-  Serial.println(
-    apChannel
-  );
+  savePersistentConfig();
 
 
   WiFi.softAPdisconnect(
@@ -1008,75 +1949,73 @@ void changeWiFiChannelNow()
   delay(50);
 
 
-  bool ok =
-    createAccessPoint();
+  bool needsSTA =
+       savedHomeWiFiExists()
+    || homeTestActive
+    || pendingHomeConnect;
 
 
-  if (!ok)
+  if(
+    !startSoftAP(
+      needsSTA
+    )
+  )
   {
-    Serial.println(
-      "AP restart failed."
-    );
-
-    Serial.println(
-      "Restarting ESP..."
-    );
-
     delay(100);
+
 
     ESP.restart();
   }
-
-
-  Serial.print(
-    "RC_Car active on CH "
-  );
-
-  Serial.println(
-    apChannel
-  );
 }
 
 
 // =====================================================================
-// ACCESS POINT WATCHDOG
+// AP HEALTH WATCHDOG
 // =====================================================================
 
-void checkAccessPoint()
+void checkAccessPointHealth()
 {
   unsigned long now =
     millis();
 
 
-  if (
-    now - lastAPCheck
+  if(
+    now
+    -
+    lastAPHealthCheck
     <
-    AP_CHECK_INTERVAL
+    AP_HEALTH_INTERVAL
   )
   {
     return;
   }
 
 
-  lastAPCheck = now;
+  lastAPHealthCheck =
+    now;
 
 
-  bool badMode =
-    WiFi.getMode()
-    !=
-    WIFI_AP;
+  WiFiMode_t mode =
+    WiFi.getMode();
 
 
-  bool badIP =
-    WiFi.softAPIP()
-    !=
-    AP_IP;
+  bool hasAP =
+       mode == WIFI_AP
+    || mode == WIFI_AP_STA;
 
 
-  if (
-    !badMode
+  bool correctIP =
+    (
+      WiFi.softAPIP()
+      ==
+      AP_IP
+    );
+
+
+  if(
+    hasAP
     &&
-    !badIP
+    correctIP
   )
   {
     return;
@@ -1084,33 +2023,88 @@ void checkAccessPoint()
 
 
   Serial.println(
-    "AP watchdog detected problem."
+    "AP watchdog recovery"
   );
 
 
   stopCar();
 
-  controllerClient = -1;
+
+  bool needsSTA =
+       savedHomeWiFiExists()
+    || homeTestActive
+    || pendingHomeConnect;
 
 
-  WiFi.softAPdisconnect(
-    true
-  );
-
-
-  delay(30);
-
-
-  if (!createAccessPoint())
+  if(
+    !startSoftAP(
+      needsSTA
+    )
+  )
   {
-    Serial.println(
-      "AP recovery failed. Rebooting."
-    );
-
     delay(100);
+
 
     ESP.restart();
   }
+}
+
+
+// =====================================================================
+// JSON ESCAPE
+// =====================================================================
+
+String jsonEscape(
+  const String& input
+)
+{
+  String output;
+
+
+  output.reserve(
+    input.length()
+    +
+    10
+  );
+
+
+  for(
+    unsigned int i = 0;
+    i < input.length();
+    i++
+  )
+  {
+    char c =
+      input[i];
+
+
+    if(c == '"')
+    {
+      output +=
+        "\\\"";
+    }
+
+
+    else if(c == '\\')
+    {
+      output +=
+        "\\\\";
+    }
+
+
+    else if(
+      (uint8_t)c
+      >=
+      32
+    )
+    {
+      output +=
+        c;
+    }
+  }
+
+
+  return output;
 }
 
 
@@ -1118,7 +2112,7 @@ void checkAccessPoint()
 // WEB PAGE
 // =====================================================================
 
-const char INDEX_HTML[] PROGMEM = R"HTML(
+const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html>
 
@@ -1128,10 +2122,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 
 <meta
  name="viewport"
- content="width=device-width,
- initial-scale=1,
- maximum-scale=1,
- user-scalable=no">
+ content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 
 <meta
  name="theme-color"
@@ -1142,657 +2133,442 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 
 <style>
 
-:root
-{
-    --accent:#21e28b;
-    --background:#07110e;
-    --panel:#101d18;
-    --panel2:#172923;
-    --text:#f3fff8;
-    --muted:#81938a;
-    --danger:#ff4057;
+:root{
+ --accent:#21e28b;
+ --background:#07110e;
+ --panel:#101d18;
+ --panel2:#172923;
+ --text:#f3fff8;
+ --muted:#82948c;
+ --red:#ff4057;
+ --orange:#ffad32;
 }
 
-
-*
-{
-    box-sizing:border-box;
-
-    user-select:none;
-
-    -webkit-user-select:none;
-
-    -webkit-tap-highlight-color:transparent;
+*{
+ box-sizing:border-box;
+ -webkit-user-select:none;
+ user-select:none;
+ -webkit-tap-highlight-color:transparent;
 }
-
 
 html,
-body
-{
-    width:100%;
-    height:100%;
+body{
+ width:100%;
+ height:100%;
+ margin:0;
+ overflow:hidden;
+}
 
-    margin:0;
+body{
+ color:var(--text);
+ font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+ background:
+ radial-gradient(circle at 50% -20%,#1d4b3a,var(--background) 46%);
+ touch-action:none;
+}
 
-    overflow:hidden;
+.app{
+ height:100%;
+ max-width:760px;
+ margin:auto;
+ padding:11px;
+ display:flex;
+ flex-direction:column;
 }
 
 
-body
-{
-    background:
-        radial-gradient(
-            circle at 50% -20%,
-            #1d4939,
-            var(--background) 45%
-        );
+/* HEADER */
 
-    color:var(--text);
+header{
+ min-height:58px;
+ display:flex;
+ align-items:center;
+ justify-content:space-between;
+}
 
-    font-family:
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        sans-serif;
+.title{
+ font-size:20px;
+ font-weight:900;
+}
 
-    touch-action:none;
+.subtitle{
+ margin-top:3px;
+ color:var(--muted);
+ font-size:11px;
+}
+
+.dot{
+ display:inline-block;
+ width:8px;
+ height:8px;
+ margin-right:5px;
+ border-radius:50%;
+ background:#777;
+}
+
+.dot.ws{
+ background:var(--accent);
+ box-shadow:0 0 12px var(--accent);
+}
+
+.dot.http{
+ background:var(--orange);
+ box-shadow:0 0 10px #ffad3266;
+}
+
+.topButtons{
+ display:flex;
+ gap:7px;
+}
+
+.iconButton{
+ height:42px;
+ padding:0 12px;
+ border-radius:13px;
+ border:1px solid #ffffff16;
+ background:var(--panel);
+ color:white;
+ font-weight:800;
 }
 
 
-.app
-{
-    height:100%;
+/* STATS */
 
-    max-width:720px;
+.stats{
+ display:grid;
+ grid-template-columns:repeat(5,1fr);
+ gap:6px;
+ margin:6px 0 9px;
+}
 
-    margin:auto;
+.stat{
+ padding:7px 2px;
+ border-radius:11px;
+ text-align:center;
+ background:#ffffff07;
+ border:1px solid #ffffff0d;
+}
 
-    padding:12px;
+.stat strong{
+ display:block;
+ color:var(--accent);
+ font-size:13px;
+}
 
-    display:flex;
-
-    flex-direction:column;
+.stat span{
+ color:var(--muted);
+ font-size:8px;
+ text-transform:uppercase;
 }
 
 
-/* ===========================================================
-   HEADER
-=========================================================== */
+/* MAIN */
 
-header
-{
-    min-height:55px;
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:space-between;
+main{
+ flex:1;
+ min-height:0;
+ display:flex;
+ align-items:center;
+ justify-content:space-around;
+ gap:12px;
 }
 
 
-.title
-{
-    font-size:20px;
+/* PAD */
 
-    font-weight:900;
+.pad{
+ display:grid;
+ grid-template-columns:repeat(3,75px);
+ grid-template-rows:repeat(3,75px);
+ gap:8px;
+}
+
+.driveButton{
+ border:1px solid #ffffff15;
+ border-radius:20px;
+ background:linear-gradient(145deg,#182a23,#0b1511);
+ color:white;
+ font-size:26px;
+ touch-action:none;
+ box-shadow:0 7px 16px #0005;
+}
+
+.driveButton.active{
+ background:var(--accent);
+ color:#00150a;
+ transform:scale(.92);
+}
+
+.stopButton{
+ background:#401019;
+ color:#ff8090;
 }
 
 
-.sub
-{
-    margin-top:3px;
+/* SIDE */
 
-    color:var(--muted);
+.side{
+ width:180px;
+ display:flex;
+ flex-direction:column;
+ gap:8px;
+}
 
-    font-size:11px;
+.card{
+ padding:13px;
+ border-radius:17px;
+ background:#ffffff08;
+ border:1px solid #ffffff0e;
+}
+
+.row{
+ display:flex;
+ justify-content:space-between;
+ align-items:center;
+ gap:8px;
+}
+
+.speedNumber{
+ color:var(--accent);
+ font-size:28px;
+ font-weight:900;
+}
+
+input[type=range]{
+ width:100%;
+ accent-color:var(--accent);
+}
+
+.modeButtons{
+ display:grid;
+ grid-template-columns:1fr 1fr;
+ gap:6px;
+ margin-top:8px;
+}
+
+.smallButton{
+ padding:9px 4px;
+ border-radius:10px;
+ border:1px solid #ffffff13;
+ background:var(--panel2);
+ color:white;
+ font-weight:700;
+ font-size:11px;
+}
+
+.smallButton.selected{
+ background:var(--accent);
+ color:#00150a;
+}
+
+.wifiButton{
+ height:48px;
+ border:1px solid #45a7ff66;
+ border-radius:15px;
+ background:#102537;
+ color:#8dcbff;
+ font-weight:900;
+}
+
+.emergencyButton{
+ height:50px;
+ border:1px solid #ff5568;
+ border-radius:15px;
+ background:#3b1018;
+ color:#ff8492;
+ font-weight:900;
 }
 
 
-.dot
-{
-    display:inline-block;
+/* MODAL */
 
-    width:8px;
+.overlay{
+ position:fixed;
+ inset:0;
+ display:none;
+ align-items:flex-end;
+ justify-content:center;
+ z-index:30;
+ background:#000c;
+ backdrop-filter:blur(6px);
+}
 
-    height:8px;
+.overlay.show{
+ display:flex;
+}
 
-    margin-right:5px;
+.panel{
+ width:min(650px,100%);
+ max-height:93vh;
+ overflow:auto;
+ padding:18px;
+ background:#0c1713;
+ border-radius:24px 24px 0 0;
+}
 
-    border-radius:50%;
+.panelHeader{
+ display:flex;
+ justify-content:space-between;
+ align-items:center;
+ position:sticky;
+ top:-18px;
+ padding:12px 0;
+ background:#0c1713;
+ z-index:2;
+}
 
-    background:#777;
+.closeButton{
+ width:38px;
+ height:38px;
+ border:0;
+ border-radius:11px;
+ background:#ffffff10;
+ color:white;
+}
+
+.sectionTitle{
+ margin:17px 0 6px;
+ color:var(--accent);
+ font-size:11px;
+ font-weight:900;
+ letter-spacing:1px;
+ text-transform:uppercase;
+}
+
+.setting{
+ padding:11px 0;
+ border-bottom:1px solid #ffffff0c;
+}
+
+.setting label{
+ font-size:14px;
+ font-weight:700;
+}
+
+.hint{
+ margin-top:3px;
+ color:var(--muted);
+ font-size:10px;
+}
+
+.value{
+ color:var(--accent);
+ font-weight:800;
+}
+
+select,
+input[type=text],
+input[type=password]{
+ padding:10px;
+ border-radius:10px;
+ border:1px solid #ffffff16;
+ background:var(--panel2);
+ color:white;
+}
+
+.fullInput{
+ width:100%;
+ margin-top:8px;
+ font-size:16px;
+}
+
+.action{
+ width:100%;
+ margin-top:9px;
+ padding:12px;
+ border:0;
+ border-radius:11px;
+ background:var(--accent);
+ color:#00150a;
+ font-weight:900;
+}
+
+.secondary{
+ color:white;
+ background:var(--panel2);
+ border:1px solid #ffffff16;
+}
+
+.danger{
+ color:#ff8996;
+ background:#351018;
+ border:1px solid #67202b;
+}
+
+.statusBox{
+ margin-top:8px;
+ padding:12px;
+ border-radius:14px;
+ border:1px solid #ffffff0e;
+ background:#ffffff07;
+}
+
+.good{
+ color:var(--accent);
+}
+
+.bad{
+ color:#ff8492;
+}
+
+.networkList{
+ display:grid;
+ gap:5px;
+ margin-top:8px;
+}
+
+.networkItem{
+ width:100%;
+ padding:10px;
+ text-align:left;
+ border:1px solid #ffffff10;
+ border-radius:9px;
+ background:var(--panel2);
+ color:white;
+}
+
+.address{
+ color:var(--accent);
+ font-weight:800;
+ word-break:break-all;
 }
 
 
-.dot.ok
-{
-    background:var(--accent);
+/* RESPONSIVE */
 
-    box-shadow:
-        0 0 12px
-        var(--accent);
+@media(max-width:520px){
+
+ .pad{
+  grid-template-columns:repeat(3,66px);
+  grid-template-rows:repeat(3,66px);
+ }
+
+ .side{
+  width:132px;
+ }
+
+ .stats{
+  grid-template-columns:repeat(5,1fr);
+ }
+
 }
 
 
-.gear
-{
-    width:42px;
+@media(max-height:520px){
 
-    height:42px;
+ .stats{
+  display:none;
+ }
 
-    border:
-        1px solid
-        #ffffff15;
+ header{
+  min-height:42px;
+ }
 
-    border-radius:13px;
+ .pad{
+  grid-template-columns:repeat(3,60px);
+  grid-template-rows:repeat(3,60px);
+ }
 
-    background:var(--panel);
-
-    color:white;
-
-    font-size:20px;
-}
-
-
-/* ===========================================================
-   STATUS
-=========================================================== */
-
-.stats
-{
-    display:grid;
-
-    grid-template-columns:
-        repeat(5,1fr);
-
-    gap:6px;
-
-    margin:
-        7px 0 9px;
-}
-
-
-.stat
-{
-    padding:7px 3px;
-
-    text-align:center;
-
-    border:
-        1px solid
-        #ffffff0c;
-
-    background:
-        #ffffff07;
-
-    border-radius:12px;
-}
-
-
-.stat b
-{
-    display:block;
-
-    color:var(--accent);
-
-    font-size:13px;
-}
-
-
-.stat span
-{
-    color:var(--muted);
-
-    font-size:8px;
-
-    text-transform:uppercase;
-}
-
-
-/* ===========================================================
-   MAIN
-=========================================================== */
-
-main
-{
-    flex:1;
-
-    min-height:0;
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:space-around;
-
-    gap:12px;
-}
-
-
-/* ===========================================================
-   DIRECTION PAD
-=========================================================== */
-
-.pad
-{
-    display:grid;
-
-    grid-template-columns:
-        repeat(3,75px);
-
-    grid-template-rows:
-        repeat(3,75px);
-
-    gap:8px;
-}
-
-
-.drive
-{
-    border:
-        1px solid
-        #ffffff15;
-
-    border-radius:20px;
-
-    background:
-        linear-gradient(
-            145deg,
-            #182a23,
-            #0b1511
-        );
-
-    color:white;
-
-    font-size:26px;
-
-    touch-action:none;
-
-    box-shadow:
-        0 7px 16px
-        #0005;
-
-    transition:
-        transform .07s,
-        background .07s;
-}
-
-
-.drive.on
-{
-    background:
-        var(--accent);
-
-    color:#00150a;
-
-    transform:
-        scale(.92);
-
-    box-shadow:
-        0 0 22px
-        #21e28b55;
-}
-
-
-.stop
-{
-    background:#401019;
-
-    color:#ff8090;
-}
-
-
-/* ===========================================================
-   SIDE
-=========================================================== */
-
-.side
-{
-    width:180px;
-
-    display:flex;
-
-    flex-direction:column;
-
-    gap:8px;
-}
-
-
-.card
-{
-    padding:13px;
-
-    background:
-        #ffffff08;
-
-    border:
-        1px solid
-        #ffffff0e;
-
-    border-radius:17px;
-}
-
-
-.speedrow
-{
-    display:flex;
-
-    align-items:center;
-
-    justify-content:space-between;
-}
-
-
-.speed
-{
-    color:var(--accent);
-
-    font-size:28px;
-
-    font-weight:900;
-}
-
-
-input[type=range]
-{
-    width:100%;
-
-    accent-color:
-        var(--accent);
-}
-
-
-.modebuttons
-{
-    display:grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap:6px;
-
-    margin-top:8px;
-}
-
-
-.smallbtn
-{
-    padding:9px 4px;
-
-    border:
-        1px solid
-        #ffffff13;
-
-    border-radius:10px;
-
-    background:
-        var(--panel2);
-
-    color:white;
-
-    font-size:11px;
-
-    font-weight:700;
-}
-
-
-.smallbtn.selected
-{
-    background:
-        var(--accent);
-
-    color:#00150a;
-}
-
-
-.estop
-{
-    height:52px;
-
-    border:
-        1px solid
-        #ff5568;
-
-    border-radius:15px;
-
-    background:#3b1018;
-
-    color:#ff8492;
-
-    font-size:14px;
-
-    font-weight:900;
-}
-
-
-/* ===========================================================
-   SETTINGS
-=========================================================== */
-
-.overlay
-{
-    position:fixed;
-
-    inset:0;
-
-    z-index:20;
-
-    display:none;
-
-    align-items:flex-end;
-
-    justify-content:center;
-
-    background:#000b;
-
-    backdrop-filter:
-        blur(6px);
-}
-
-
-.overlay.show
-{
-    display:flex;
-}
-
-
-.settings
-{
-    width:
-        min(600px,100%);
-
-    max-height:90vh;
-
-    overflow:auto;
-
-    padding:18px;
-
-    background:#0c1713;
-
-    border-radius:
-        24px 24px 0 0;
-}
-
-
-.settingHeader
-{
-    display:flex;
-
-    justify-content:
-        space-between;
-
-    align-items:center;
-}
-
-
-.settingHeader button
-{
-    width:38px;
-
-    height:38px;
-
-    border:0;
-
-    border-radius:11px;
-
-    background:#ffffff10;
-
-    color:white;
-}
-
-
-.setting
-{
-    padding:12px 0;
-
-    border-bottom:
-        1px solid
-        #ffffff0c;
-}
-
-
-.settingtop
-{
-    display:flex;
-
-    justify-content:
-        space-between;
-
-    align-items:center;
-
-    gap:15px;
-}
-
-
-.setting label
-{
-    font-size:14px;
-
-    font-weight:700;
-}
-
-
-.hint
-{
-    margin-top:3px;
-
-    color:var(--muted);
-
-    font-size:10px;
-}
-
-
-.value
-{
-    color:var(--accent);
-
-    font-weight:800;
-}
-
-
-select
-{
-    padding:8px;
-
-    border:
-        1px solid
-        #ffffff12;
-
-    border-radius:9px;
-
-    background:
-        var(--panel2);
-
-    color:white;
-}
-
-
-.apply
-{
-    width:100%;
-
-    margin-top:10px;
-
-    padding:11px;
-
-    border:0;
-
-    border-radius:11px;
-
-    background:
-        var(--accent);
-
-    color:#00150a;
-
-    font-weight:900;
-}
-
-
-.channelstatus
-{
-    margin-top:8px;
-
-    text-align:center;
-
-    color:var(--muted);
-
-    font-size:11px;
-}
-
-
-/* ===========================================================
-   RESPONSIVE
-=========================================================== */
-
-@media(max-width:520px)
-{
-    .pad
-    {
-        grid-template-columns:
-            repeat(3,66px);
-
-        grid-template-rows:
-            repeat(3,66px);
-    }
-
-
-    .side
-    {
-        width:130px;
-    }
-
-
-    .stats
-    {
-        grid-template-columns:
-            repeat(5,1fr);
-    }
-}
-
-
-@media(max-height:520px)
-{
-    .stats
-    {
-        display:none;
-    }
-
-
-    header
-    {
-        min-height:40px;
-    }
-
-
-    .pad
-    {
-        grid-template-columns:
-            repeat(3,60px);
-
-        grid-template-rows:
-            repeat(3,60px);
-    }
 }
 
 </style>
@@ -1808,42 +2584,43 @@ select
 
 <header>
 
-
 <div>
 
 <div class="title">
-
 🏎️ RC CAR PRO
-
 </div>
 
-
-<div class="sub">
+<div class="subtitle">
 
 <span
  class="dot"
- id="dot">
+ id="connectionDot">
 </span>
 
-<span id="connection">
-
-Connecting...
-
+<span id="connectionText">
+Starting...
 </span>
 
 </div>
 
 </div>
 
+
+<div class="topButtons">
 
 <button
- class="gear"
- id="gear">
-
-⚙
-
+ class="iconButton"
+ id="homeWifiMainButton">
+📶 WiFi
 </button>
 
+<button
+ class="iconButton"
+ id="settingsMainButton">
+⚙
+</button>
+
+</div>
 
 </header>
 
@@ -1851,71 +2628,30 @@ Connecting...
 
 <div class="stats">
 
-
 <div class="stat">
-
-<b id="ping">
---
-</b>
-
-<span>
-Latency
-</span>
-
+<strong id="latencyStat">--</strong>
+<span>Latency</span>
 </div>
 
-
 <div class="stat">
-
-<b id="averagePing">
---
-</b>
-
-<span>
-Average
-</span>
-
+<strong id="transportStat">--</strong>
+<span>Control</span>
 </div>
 
-
 <div class="stat">
-
-<b id="clients">
---
-</b>
-
-<span>
-Devices
-</span>
-
+<strong id="clientStat">--</strong>
+<span>Clients</span>
 </div>
 
-
 <div class="stat">
-
-<b id="uptime">
---
-</b>
-
-<span>
-Uptime
-</span>
-
+<strong id="channelStat">--</strong>
+<span>Channel</span>
 </div>
 
-
 <div class="stat">
-
-<b id="channel">
---
-</b>
-
-<span>
-Channel
-</span>
-
+<strong id="networkStat">AP</strong>
+<span>Network</span>
 </div>
-
 
 </div>
 
@@ -1926,87 +2662,59 @@ Channel
 
 <div class="pad">
 
-
 <button
- class="drive"
- data-c="G">
-
+ class="driveButton"
+ data-drive="G">
 ↖
-
 </button>
 
-
 <button
- class="drive"
- data-c="F">
-
+ class="driveButton"
+ data-drive="F">
 ▲
-
 </button>
 
-
 <button
- class="drive"
- data-c="H">
-
+ class="driveButton"
+ data-drive="H">
 ↗
-
 </button>
 
-
 <button
- class="drive"
- data-c="L">
-
+ class="driveButton"
+ data-drive="L">
 ◀
-
 </button>
 
-
 <button
- class="drive stop"
- id="stop">
-
+ class="driveButton stopButton"
+ id="centerStopButton">
 ■
-
 </button>
 
-
 <button
- class="drive"
- data-c="R">
-
+ class="driveButton"
+ data-drive="R">
 ▶
-
 </button>
 
-
 <button
- class="drive"
- data-c="I">
-
+ class="driveButton"
+ data-drive="I">
 ↙
-
 </button>
 
-
 <button
- class="drive"
- data-c="B">
-
+ class="driveButton"
+ data-drive="B">
 ▼
-
 </button>
-
 
 <button
- class="drive"
- data-c="J">
-
+ class="driveButton"
+ data-drive="J">
 ↘
-
 </button>
-
 
 </div>
 
@@ -2017,66 +2725,57 @@ Channel
 
 <div class="card">
 
+<div class="row">
 
-<div class="speedrow">
-
-<span>
-SPEED
-</span>
+<span>SPEED</span>
 
 <span
- class="speed"
- id="speedText">
-
+ class="speedNumber"
+ id="speedNumber">
 70
-
 </span>
 
 </div>
 
 
 <input
- id="speed"
+ id="speedSlider"
  type="range"
  min="20"
  max="100"
  value="70">
 
 
-<div class="modebuttons">
-
+<div class="modeButtons">
 
 <button
- class="smallbtn selected"
- id="eco">
-
+ class="smallButton selected"
+ id="ecoModeButton">
 🌿 ECO
-
 </button>
 
-
 <button
- class="smallbtn"
- id="sport">
-
+ class="smallButton"
+ id="sportModeButton">
 ⚡ SPORT
-
 </button>
 
-
 </div>
 
-
 </div>
-
 
 
 <button
- class="estop"
- id="estop">
+ class="wifiButton"
+ id="homeWifiSideButton">
+📶 HOME WIFI
+</button>
 
-⛔ EMERGENCY STOP
 
+<button
+ class="emergencyButton"
+ id="emergencyStopButton">
+⛔ STOP
 </button>
 
 
@@ -2085,71 +2784,265 @@ SPEED
 
 </main>
 
+</div>
+
+
+
+<!-- ==============================================================
+     HOME WIFI PANEL
+================================================================ -->
+
+
+<div
+ class="overlay"
+ id="wifiOverlay">
+
+
+<div class="panel">
+
+
+<div class="panelHeader">
+
+<div>
+
+<h2 style="margin:0">
+📶 Home WiFi
+</h2>
+
+<div class="hint">
+RC_Car direct WiFi remains your recovery network.
+</div>
+
+</div>
+
+
+<button
+ class="closeButton"
+ id="closeWifiPanel">
+✕
+</button>
 
 </div>
 
 
 
-<!-- =========================================================
-     SETTINGS
-========================================================= -->
+<div class="statusBox">
+
+<div class="row">
+
+<b>Home WiFi</b>
+
+<span
+ id="homeWifiStatus">
+Checking...
+</span>
+
+</div>
 
 
 <div
- class="overlay"
- id="overlay">
+ class="hint"
+ id="homeWifiMessage">
+</div>
 
 
-<div class="settings">
+<div
+ id="homeWifiDetails"
+ style="margin-top:9px">
+</div>
+
+</div>
 
 
-<div class="settingHeader">
+
+<div class="sectionTitle">
+Connect to router
+</div>
 
 
-<h2>
+<button
+ class="action secondary"
+ id="scanNetworksButton">
+📡 SCAN AVAILABLE WIFI
+</button>
 
-⚙ Car Settings
 
-</h2>
+<div
+ class="networkList"
+ id="networkList">
+</div>
 
 
-<button id="close">
 
-✕
+<div class="setting">
 
+<label for="ssidInput">
+WiFi Name / SSID
+</label>
+
+<input
+ class="fullInput"
+ id="ssidInput"
+ type="text"
+ maxlength="32"
+ autocomplete="off"
+ placeholder="Enter your home WiFi name">
+
+</div>
+
+
+
+<div class="setting">
+
+<label for="passwordInput">
+WiFi Password
+</label>
+
+<input
+ class="fullInput"
+ id="passwordInput"
+ type="password"
+ maxlength="64"
+ autocomplete="off"
+ placeholder="Enter your WiFi password">
+
+</div>
+
+
+
+<div
+ class="row"
+ style="margin-top:9px">
+
+<label for="showPasswordCheckbox">
+Show Password
+</label>
+
+<input
+ id="showPasswordCheckbox"
+ type="checkbox">
+
+</div>
+
+
+
+<button
+ class="action"
+ id="connectWifiButton">
+CONNECT & TEST
+</button>
+
+
+<div class="hint">
+Credentials are saved only after the ESP8266 successfully connects.
+A wrong password will not overwrite the previous working network.
+</div>
+
+
+
+<div class="sectionTitle">
+Addresses
+</div>
+
+
+<div class="statusBox">
+
+<div>
+Direct connection:
+</div>
+
+<div class="address">
+http://192.168.4.1
+</div>
+
+
+<div style="margin-top:9px">
+Home network:
+</div>
+
+<div class="address">
+http://rccar.local
+</div>
+
+
+<div
+ class="hint"
+ id="homeAddressHint">
+
+rccar.local becomes available after Home WiFi connects.
+
+</div>
+
+</div>
+
+
+
+<button
+ class="action danger"
+ id="forgetWifiButton">
+FORGET SAVED HOME WIFI
 </button>
 
 
 </div>
 
+</div>
 
 
-<!-- STEERING -->
+
+<!-- ==============================================================
+     CAR SETTINGS
+================================================================ -->
+
+
+<div
+ class="overlay"
+ id="settingsOverlay">
+
+
+<div class="panel">
+
+
+<div class="panelHeader">
+
+<h2 style="margin:0">
+⚙ Car Settings
+</h2>
+
+
+<button
+ class="closeButton"
+ id="closeSettingsPanel">
+✕
+</button>
+
+</div>
+
+
+
+<div class="sectionTitle">
+Driving
+</div>
 
 
 <div class="setting">
 
-
-<div class="settingtop">
-
+<div class="row">
 
 <div>
 
 <label>
-Steering Style
+Steering
 </label>
 
 <div class="hint">
-
-Smooth saves power.
-Pivot turns on the spot.
-
+Smooth uses less power.
 </div>
 
 </div>
 
 
-<select id="steering">
+<select id="steeringSelect">
 
 <option value="1">
 Smooth
@@ -2161,268 +3054,150 @@ Pivot
 
 </select>
 
+</div>
 
 </div>
 
-
-</div>
-
-
-
-<!-- TURN STRENGTH -->
 
 
 <div class="setting">
 
-
-<div class="settingtop">
-
-
-<div>
+<div class="row">
 
 <label>
 Turn Strength
 </label>
 
-<div class="hint">
-
-Higher value gives sharper turns.
-
-</div>
-
-</div>
-
-
 <span
  class="value"
- id="turnText">
-
+ id="turnValue">
 70%
-
 </span>
-
 
 </div>
 
-
 <input
- id="turn"
+ id="turnSlider"
  type="range"
  min="30"
  max="100"
  value="70">
 
-
 </div>
 
-
-
-<!-- ACCELERATION -->
 
 
 <div class="setting">
 
-
-<div class="settingtop">
-
-
-<div>
+<div class="row">
 
 <label>
 Acceleration
-
 </label>
-
-
-<div class="hint">
-
-Lower value reduces current spikes.
-
-</div>
-
-
-</div>
-
 
 <span
  class="value"
- id="rampText">
-
+ id="rampValue">
 10
-
 </span>
-
 
 </div>
 
-
 <input
- id="ramp"
+ id="rampSlider"
  type="range"
  min="4"
  max="30"
  value="10">
 
-
 </div>
 
 
 
-<!-- LEFT TRIM -->
-
-
 <div class="setting">
 
-
-<div class="settingtop">
-
-
-<div>
-
+<div class="row">
 
 <label>
 Left Motor Trim
 </label>
 
-
-<div class="hint">
-
-Adjust if car doesn't drive straight.
-
-</div>
-
-
-</div>
-
-
 <span
  class="value"
- id="leftText">
-
+ id="leftTrimValue">
 100%
-
 </span>
-
 
 </div>
 
-
 <input
- id="leftTrim"
+ id="leftTrimSlider"
  type="range"
  min="70"
  max="110"
  value="100">
 
-
 </div>
 
 
 
-<!-- RIGHT TRIM -->
-
-
 <div class="setting">
 
-
-<div class="settingtop">
-
-
-<div>
+<div class="row">
 
 <label>
 Right Motor Trim
 </label>
 
-<div class="hint">
-
-Adjust if car doesn't drive straight.
-
-</div>
-
-</div>
-
-
 <span
  class="value"
- id="rightText">
-
+ id="rightTrimValue">
 100%
-
 </span>
-
 
 </div>
 
-
 <input
- id="rightTrim"
+ id="rightTrimSlider"
  type="range"
  min="70"
  max="110"
  value="100">
 
-
 </div>
 
-
-
-<!-- ECO LIMIT -->
 
 
 <div class="setting">
 
-
-<div class="settingtop">
-
-
-<div>
+<div class="row">
 
 <label>
-ECO Maximum Speed
+ECO Speed Limit
 </label>
-
-<div class="hint">
-
-Lower gives longer battery runtime.
-
-</div>
-
-</div>
-
 
 <span
  class="value"
- id="ecoLimitText">
-
+ id="ecoLimitValue">
 85%
-
 </span>
-
 
 </div>
 
-
 <input
- id="ecoLimit"
+ id="ecoLimitSlider"
  type="range"
  min="50"
  max="100"
  value="85">
 
-
 </div>
 
 
 
-<!-- SWAP LEFT / RIGHT -->
-
-
 <div class="setting">
 
-
-<div class="settingtop">
-
+<div class="row">
 
 <div>
 
@@ -2431,55 +3206,46 @@ Swap Left / Right
 </label>
 
 <div class="hint">
-
 Enabled for your current motor orientation.
-
 </div>
 
 </div>
 
 
 <input
- id="swap"
+ id="swapSteeringCheckbox"
  type="checkbox"
  checked>
 
+</div>
 
 </div>
 
 
+
+<div class="sectionTitle">
+Direct RC_Car WiFi
 </div>
-
-
-
-<!-- WIFI CHANNEL -->
 
 
 <div class="setting">
 
-
-<div class="settingtop">
-
+<div class="row">
 
 <div>
-
 
 <label>
 WiFi Channel
 </label>
 
-
 <div class="hint">
-
-Test 1, 6 and 11 and keep the one with lowest stable latency.
+Used when Home WiFi is disconnected.
+</div>
 
 </div>
 
 
-</div>
-
-
-<select id="wifiChannel">
+<select id="channelSelect">
 
 <option value="1">
 Channel 1
@@ -2495,99 +3261,20 @@ Channel 11
 
 </select>
 
-
 </div>
 
 
-
 <button
- class="apply"
- id="applyChannel">
-
-APPLY WIFI CHANNEL
-
+ class="action"
+ id="applyChannelButton">
+APPLY CHANNEL
 </button>
 
 
 <div
- class="channelstatus"
- id="currentChannel">
-
-Current Channel: --
-
-</div>
-
-
-<div
  class="hint"
- style="text-align:center;">
-
-Changing the channel temporarily disconnects WiFi.
-RC_Car will restart automatically.
-
+ id="channelMessage">
 </div>
-
-
-</div>
-
-
-
-<!-- WIFI POWER -->
-
-
-<div class="setting">
-
-
-<div class="settingtop">
-
-
-<div>
-
-<label>
-WiFi Transmit Power
-</label>
-
-<div class="hint">
-
-Lower power saves energy.
-Increase it if range or stability becomes poor.
-
-</div>
-
-</div>
-
-
-<select id="wifiPower">
-
-<option value="85">
-8.5 dBm
-</option>
-
-<option value="110">
-11 dBm
-</option>
-
-<option
- value="140"
- selected>
-
-14 dBm
-
-</option>
-
-<option value="175">
-17.5 dBm
-</option>
-
-<option value="205">
-20.5 dBm
-</option>
-
-</select>
-
-
-</div>
-
 
 </div>
 
@@ -2600,1362 +3287,1934 @@ Increase it if range or stability becomes poor.
 
 <script>
 
-// =====================================================================
-// CONFIGURATION
-// =====================================================================
+"use strict";
+
+
+// ==================================================================
+// DOM
+// ==================================================================
+
+function byId(id)
+{
+ return document.getElementById(id);
+}
+
+
+const ui =
+{
+ dot:
+  byId("connectionDot"),
+
+ connection:
+  byId("connectionText"),
+
+ latency:
+  byId("latencyStat"),
+
+ transport:
+  byId("transportStat"),
+
+ clients:
+  byId("clientStat"),
+
+ channel:
+  byId("channelStat"),
+
+ network:
+  byId("networkStat"),
+
+
+ speedSlider:
+  byId("speedSlider"),
+
+ speedNumber:
+  byId("speedNumber"),
+
+ eco:
+  byId("ecoModeButton"),
+
+ sport:
+  byId("sportModeButton"),
+
+
+ stop:
+  byId("centerStopButton"),
+
+ emergency:
+  byId("emergencyStopButton"),
+
+
+ wifiMain:
+  byId("homeWifiMainButton"),
+
+ wifiSide:
+  byId("homeWifiSideButton"),
+
+ wifiOverlay:
+  byId("wifiOverlay"),
+
+ wifiClose:
+  byId("closeWifiPanel"),
+
+
+ settingsMain:
+  byId("settingsMainButton"),
+
+ settingsOverlay:
+  byId("settingsOverlay"),
+
+ settingsClose:
+  byId("closeSettingsPanel"),
+
+
+ homeStatus:
+  byId("homeWifiStatus"),
+
+ homeMessage:
+  byId("homeWifiMessage"),
+
+ homeDetails:
+  byId("homeWifiDetails"),
+
+ homeAddressHint:
+  byId("homeAddressHint"),
+
+
+ scan:
+  byId("scanNetworksButton"),
+
+ networkList:
+  byId("networkList"),
+
+ ssid:
+  byId("ssidInput"),
+
+ password:
+  byId("passwordInput"),
+
+ showPassword:
+  byId("showPasswordCheckbox"),
+
+ connectWifi:
+  byId("connectWifiButton"),
+
+ forgetWifi:
+  byId("forgetWifiButton"),
+
+
+ steering:
+  byId("steeringSelect"),
+
+ turn:
+  byId("turnSlider"),
+
+ turnValue:
+  byId("turnValue"),
+
+ ramp:
+  byId("rampSlider"),
+
+ rampValue:
+  byId("rampValue"),
+
+ leftTrim:
+  byId("leftTrimSlider"),
+
+ leftTrimValue:
+  byId("leftTrimValue"),
+
+ rightTrim:
+  byId("rightTrimSlider"),
+
+ rightTrimValue:
+  byId("rightTrimValue"),
+
+ ecoLimit:
+  byId("ecoLimitSlider"),
+
+ ecoLimitValue:
+  byId("ecoLimitValue"),
+
+ swap:
+  byId("swapSteeringCheckbox"),
+
+
+ channelSelect:
+  byId("channelSelect"),
+
+ applyChannel:
+  byId("applyChannelButton"),
+
+ channelMessage:
+  byId("channelMessage")
+};
+
+
+// ==================================================================
+// LOCAL SETTINGS
+// ==================================================================
 
 const defaults =
 {
-    speed:70,
+ speed:70,
 
-    turn:70,
+ turn:70,
 
-    ramp:10,
+ ramp:10,
 
-    leftTrim:100,
+ leftTrim:100,
 
-    rightTrim:100,
+ rightTrim:100,
 
-    steering:1,
+ steering:1,
 
-    swap:true,
+ swap:true,
 
-    eco:true,
+ eco:true,
 
-    ecoLimit:85,
-
-    wifiPower:140
+ ecoLimit:85
 };
 
 
 let cfg =
-    Object.assign(
-        {},
-        defaults
-    );
+ Object.assign(
+  {},
+  defaults
+ );
 
 
 try
 {
-    const saved =
-        JSON.parse(
-            localStorage.getItem(
-                "RC_CONFIG"
-            )
-        );
+ const saved =
+  JSON.parse(
+   localStorage.getItem(
+    "RC_CAR_CONFIG"
+   )
+  );
 
 
-    if(saved)
-    {
-        Object.assign(
-            cfg,
-            saved
-        );
-    }
+ if(saved)
+ {
+  Object.assign(
+   cfg,
+   saved
+  );
+ }
 }
-catch(e)
+catch(error)
 {
 }
 
 
-// =====================================================================
-// WEBSOCKET
-// =====================================================================
+function saveLocalConfig()
+{
+ localStorage.setItem(
+  "RC_CAR_CONFIG",
+  JSON.stringify(cfg)
+ );
+}
+
+
+// ==================================================================
+// APPLY LOCAL UI
+// ==================================================================
+
+function applyLocalUI()
+{
+ ui.speedSlider.value =
+  cfg.speed;
+
+
+ ui.speedNumber.textContent =
+  cfg.speed;
+
+
+ ui.turn.value =
+  cfg.turn;
+
+
+ ui.turnValue.textContent =
+  cfg.turn + "%";
+
+
+ ui.ramp.value =
+  cfg.ramp;
+
+
+ ui.rampValue.textContent =
+  cfg.ramp;
+
+
+ ui.leftTrim.value =
+  cfg.leftTrim;
+
+
+ ui.leftTrimValue.textContent =
+  cfg.leftTrim + "%";
+
+
+ ui.rightTrim.value =
+  cfg.rightTrim;
+
+
+ ui.rightTrimValue.textContent =
+  cfg.rightTrim + "%";
+
+
+ ui.ecoLimit.value =
+  cfg.ecoLimit;
+
+
+ ui.ecoLimitValue.textContent =
+  cfg.ecoLimit + "%";
+
+
+ ui.steering.value =
+  cfg.steering;
+
+
+ ui.swap.checked =
+  cfg.swap;
+
+
+ ui.eco.classList.toggle(
+  "selected",
+  cfg.eco
+ );
+
+
+ ui.sport.classList.toggle(
+  "selected",
+  !cfg.eco
+ );
+}
+
+
+// ==================================================================
+// WEBSOCKET / HTTP FALLBACK
+// ==================================================================
 
 let ws = null;
 
 let reconnectTimer = null;
 
-let driveTimer = null;
-
-let currentCommand = "S";
-
-let activeButton = null;
+let controlTransport =
+ "HTTP";
 
 
-// =====================================================================
-// PING
-// =====================================================================
-
-let pingHistory = [];
-
-
-// =====================================================================
-// SAVE CONFIG
-// =====================================================================
-
-function save()
+function websocketReady()
 {
-    localStorage.setItem(
-        "RC_CONFIG",
-        JSON.stringify(cfg)
-    );
+ return (
+  ws
+  &&
+  ws.readyState
+  ===
+  WebSocket.OPEN
+ );
 }
 
 
-// =====================================================================
-// WEBSOCKET SEND
-// =====================================================================
-
-function send(message)
+function showWebSocketReady()
 {
-    if(
-        ws
-        &&
-        ws.readyState
-        ===
-        WebSocket.OPEN
-    )
+ controlTransport =
+  "WS";
+
+
+ ui.dot.className =
+  "dot ws";
+
+
+ ui.connection.textContent =
+  "WEBSOCKET • READY";
+
+
+ ui.transport.textContent =
+  "WS";
+}
+
+
+function showHTTPReady()
+{
+ if(websocketReady())
+ {
+  return;
+ }
+
+
+ controlTransport =
+  "HTTP";
+
+
+ ui.dot.className =
+  "dot http";
+
+
+ ui.connection.textContent =
+  "HTTP BACKUP • READY";
+
+
+ ui.transport.textContent =
+  "HTTP";
+}
+
+
+function showOffline()
+{
+ if(websocketReady())
+ {
+  return;
+ }
+
+
+ ui.dot.className =
+  "dot";
+
+
+ ui.connection.textContent =
+  "RECONNECTING...";
+
+
+ ui.transport.textContent =
+  "--";
+}
+
+
+// ==================================================================
+// STATE
+// ==================================================================
+
+function applyState(state)
+{
+ ui.clients.textContent =
+  state.clients;
+
+
+ ui.channel.textContent =
+  "CH" + state.channel;
+
+
+ ui.channelSelect.value =
+  state.savedChannel;
+
+
+ if(state.homeConnected)
+ {
+  ui.network.textContent =
+   "HOME";
+
+
+  ui.channelSelect.disabled =
+   true;
+
+
+  ui.applyChannel.disabled =
+   true;
+
+
+  ui.channelMessage.textContent =
+   "Home router currently controls the radio channel: CH "
+   +
+   state.channel;
+ }
+
+ else
+ {
+  ui.network.textContent =
+   "AP";
+
+
+  ui.channelSelect.disabled =
+   false;
+
+
+  ui.applyChannel.disabled =
+   false;
+
+
+  ui.channelMessage.textContent =
+   "Try channels 1, 6 and 11 and keep the lowest-latency one.";
+ }
+}
+
+
+// ==================================================================
+// HTTP HEALTH CHECK
+// ==================================================================
+
+async function probeHTTP()
+{
+ try
+ {
+  const response =
+   await fetch(
+    "/api/state",
     {
-        ws.send(message);
-
-        return true;
+     cache:"no-store"
     }
+   );
 
 
-    return false;
+  if(!response.ok)
+  {
+   throw new Error(
+    "HTTP unavailable"
+   );
+  }
+
+
+  const state =
+   await response.json();
+
+
+  applyState(
+   state
+  );
+
+
+  if(!websocketReady())
+  {
+   showHTTPReady();
+  }
+
+
+  return true;
+ }
+
+ catch(error)
+ {
+  if(!websocketReady())
+  {
+   showOffline();
+  }
+
+
+  return false;
+ }
 }
 
 
-// =====================================================================
-// CONNECT
-// =====================================================================
+// ==================================================================
+// WEBSOCKET
+// ==================================================================
 
-function connect()
+function connectWebSocket()
 {
-    clearTimeout(
-        reconnectTimer
-    );
-
-
-    ws =
-        new WebSocket(
-            "ws://"
-            +
-            location.hostname
-            +
-            ":81/"
-        );
-
-
-    ws.onopen =
-        function()
-        {
-            document
-                .getElementById(
-                    "dot"
-                )
-                .classList
-                .add(
-                    "ok"
-                );
-
-
-            document
-                .getElementById(
-                    "connection"
-                )
-                .textContent =
-                "LOW LATENCY CONNECTED";
-
-
-            sendConfig();
-
-
-            send(
-                "S:"
-                +
-                cfg.speed
-            );
-        };
-
-
-    ws.onclose =
-        function()
-        {
-            stopLocal();
-
-
-            document
-                .getElementById(
-                    "dot"
-                )
-                .classList
-                .remove(
-                    "ok"
-                );
-
-
-            document
-                .getElementById(
-                    "connection"
-                )
-                .textContent =
-                "RECONNECTING...";
-
-
-            reconnectTimer =
-                setTimeout(
-                    connect,
-                    500
-                );
-        };
-
-
-    ws.onerror =
-        function()
-        {
-            try
-            {
-                ws.close();
-            }
-            catch(e)
-            {
-            }
-        };
-
-
-    ws.onmessage =
-        function(event)
-        {
-            const msg =
-                event.data;
-
-
-            // -------------------------------------------------
-            // PING RESPONSE
-            // -------------------------------------------------
-
-            if(
-                msg.startsWith(
-                    "P:"
-                )
-            )
-            {
-                const timestamp =
-                    Number(
-                        msg.substring(2)
-                    );
-
-
-                const rtt =
-                    Date.now()
-                    -
-                    timestamp;
-
-
-                document
-                    .getElementById(
-                        "ping"
-                    )
-                    .textContent =
-                    rtt
-                    +
-                    "ms";
-
-
-                pingHistory.push(
-                    rtt
-                );
-
-
-                if(
-                    pingHistory.length
-                    >
-                    10
-                )
-                {
-                    pingHistory.shift();
-                }
-
-
-                const average =
-                    Math.round(
-                        pingHistory.reduce(
-                            (a,b) =>
-                                a+b,
-                            0
-                        )
-                        /
-                        pingHistory.length
-                    );
-
-
-                document
-                    .getElementById(
-                        "averagePing"
-                    )
-                    .textContent =
-                    average
-                    +
-                    "ms";
-
-
-                return;
-            }
-
-
-            // -------------------------------------------------
-            // STATUS RESPONSE
-            // -------------------------------------------------
-
-            if(
-                msg.startsWith(
-                    "T:"
-                )
-            )
-            {
-                const p =
-                    msg
-                    .substring(2)
-                    .split(",");
-
-
-                document
-                    .getElementById(
-                        "clients"
-                    )
-                    .textContent =
-                    p[0];
-
-
-                document
-                    .getElementById(
-                        "uptime"
-                    )
-                    .textContent =
-                    formatTime(
-                        Number(
-                            p[1]
-                        )
-                    );
-
-
-                const currentChannel =
-                    Number(
-                        p[3]
-                    );
-
-
-                document
-                    .getElementById(
-                        "channel"
-                    )
-                    .textContent =
-                    "CH"
-                    +
-                    currentChannel;
-
-
-                document
-                    .getElementById(
-                        "currentChannel"
-                    )
-                    .textContent =
-                    "Current Channel: "
-                    +
-                    currentChannel;
-
-
-                document
-                    .getElementById(
-                        "wifiChannel"
-                    )
-                    .value =
-                    currentChannel;
-
-
-                return;
-            }
-
-
-            // -------------------------------------------------
-            // CHANNEL SWITCH ACKNOWLEDGEMENT
-            // -------------------------------------------------
-
-            if(
-                msg.startsWith(
-                    "CHANGING:"
-                )
-            )
-            {
-                const channel =
-                    msg.split(":")[1];
-
-
-                document
-                    .getElementById(
-                        "connection"
-                    )
-                    .textContent =
-                    "SWITCHING TO CH "
-                    +
-                    channel;
-
-
-                document
-                    .getElementById(
-                        "currentChannel"
-                    )
-                    .textContent =
-                    "Switching to Channel "
-                    +
-                    channel
-                    +
-                    "...";
-
-
-                return;
-            }
-
-
-            // -------------------------------------------------
-            // ALREADY CURRENT CHANNEL
-            // -------------------------------------------------
-
-            if(
-                msg.startsWith(
-                    "CH:"
-                )
-            )
-            {
-                const channel =
-                    msg.split(":")[1];
-
-
-                document
-                    .getElementById(
-                        "currentChannel"
-                    )
-                    .textContent =
-                    "Current Channel: "
-                    +
-                    channel;
-
-
-                return;
-            }
-        };
+ clearTimeout(
+  reconnectTimer
+ );
+
+
+ try
+ {
+  ws =
+   new WebSocket(
+    "ws://"
+    +
+    location.hostname
+    +
+    ":81/"
+   );
+ }
+
+ catch(error)
+ {
+  showHTTPReady();
+
+  scheduleWebSocketReconnect();
+
+  return;
+ }
+
+
+ ws.onopen =
+  function()
+  {
+   showWebSocketReady();
+
+
+   sendRuntimeConfig();
+
+
+   sendSpeed(
+    cfg.speed
+   );
+  };
+
+
+ ws.onclose =
+  function()
+  {
+   stopDrive();
+
+
+   probeHTTP();
+
+
+   scheduleWebSocketReconnect();
+  };
+
+
+ ws.onerror =
+  function()
+  {
+   try
+   {
+    ws.close();
+   }
+   catch(error)
+   {
+   }
+  };
+
+
+ ws.onmessage =
+  function(event)
+  {
+   const message =
+    event.data;
+
+
+   if(
+    message.startsWith(
+     "P:"
+    )
+   )
+   {
+    const start =
+     Number(
+      message.substring(2)
+     );
+
+
+    ui.latency.textContent =
+     (
+      Date.now()
+      -
+      start
+     )
+     +
+     "ms";
+
+
+    return;
+   }
+
+
+   if(
+    message.startsWith(
+     "CHANGING:"
+    )
+   )
+   {
+    ui.channelMessage.textContent =
+     "Switching to channel "
+     +
+     message.split(":")[1]
+     +
+     "...";
+
+
+    return;
+   }
+
+
+   if(
+    message.startsWith(
+     "CHANNEL_LOCKED:"
+    )
+   )
+   {
+    ui.channelMessage.textContent =
+     "Home router controls channel "
+     +
+     message.split(":")[1];
+
+
+    return;
+   }
+  };
 }
 
 
-// =====================================================================
+function scheduleWebSocketReconnect()
+{
+ clearTimeout(
+  reconnectTimer
+ );
+
+
+ reconnectTimer =
+  setTimeout(
+   connectWebSocket,
+   1000
+  );
+}
+
+
+// ==================================================================
+// DRIVE TRANSPORT
+// ==================================================================
+
+function sendDrive(command)
+{
+ if(websocketReady())
+ {
+  ws.send(
+   "D:"
+   +
+   command
+  );
+
+
+  return;
+ }
+
+
+ fetch(
+  "/api/drive?c="
+  +
+  encodeURIComponent(command),
+
+  {
+   cache:"no-store"
+  }
+
+ ).catch(
+  function(){}
+ );
+}
+
+
+function sendSpeed(value)
+{
+ if(websocketReady())
+ {
+  ws.send(
+   "S:"
+   +
+   value
+  );
+
+
+  return;
+ }
+
+
+ fetch(
+  "/api/speed?v="
+  +
+  value,
+
+  {
+   cache:"no-store"
+  }
+
+ ).catch(
+  function(){}
+ );
+}
+
+
+// ==================================================================
 // CONFIG SEND
-// =====================================================================
+// ==================================================================
 
 let configTimer = null;
 
 
-function sendConfig()
+function sendRuntimeConfig()
 {
-    clearTimeout(
-        configTimer
-    );
+ clearTimeout(
+  configTimer
+ );
 
 
-    configTimer =
-        setTimeout(
-            function()
-            {
-                send(
+ configTimer =
+  setTimeout(
+   function()
+   {
+    if(websocketReady())
+    {
+     ws.send(
+      "C:"
+      +
+      cfg.turn + ","
+      +
+      cfg.leftTrim + ","
+      +
+      cfg.rightTrim + ","
+      +
+      cfg.ramp + ","
+      +
+      cfg.steering + ","
+      +
+      (cfg.swap ? 1 : 0) + ","
+      +
+      (cfg.eco ? 1 : 0) + ","
+      +
+      cfg.ecoLimit
+     );
+    }
 
-                    "C:"
-                    +
-                    cfg.turn
-                    +
-                    ","
-                    +
-                    cfg.leftTrim
-                    +
-                    ","
-                    +
-                    cfg.rightTrim
-                    +
-                    ","
-                    +
-                    cfg.ramp
-                    +
-                    ","
-                    +
-                    cfg.steering
-                    +
-                    ","
-                    +
-                    (cfg.swap ? 1 : 0)
-                    +
-                    ","
-                    +
-                    (cfg.eco ? 1 : 0)
-                    +
-                    ","
-                    +
-                    cfg.ecoLimit
-                    +
-                    ","
-                    +
-                    cfg.wifiPower
-                );
-            },
+    else
+    {
+     const url =
+      "/api/config?"
+      +
+      "turn=" + cfg.turn
+      +
+      "&lt=" + cfg.leftTrim
+      +
+      "&rt=" + cfg.rightTrim
+      +
+      "&ramp=" + cfg.ramp
+      +
+      "&steer=" + cfg.steering
+      +
+      "&swap=" + (cfg.swap ? 1 : 0)
+      +
+      "&eco=" + (cfg.eco ? 1 : 0)
+      +
+      "&limit=" + cfg.ecoLimit;
 
-            40
-        );
+
+     fetch(
+      url,
+      {
+       cache:"no-store"
+      }
+
+     ).catch(
+      function(){}
+     );
+    }
+   },
+
+   50
+  );
 }
 
 
-// =====================================================================
-// DRIVE
-// =====================================================================
+// ==================================================================
+// DRIVE BUTTONS
+// ==================================================================
 
-function drive(
-    command,
-    button
+let driveTimer = null;
+
+let activeButton = null;
+
+let currentDriveCommand = "S";
+
+
+function startDrive(
+ command,
+ button
 )
 {
-    clearInterval(
-        driveTimer
+ clearInterval(
+  driveTimer
+ );
+
+
+ currentDriveCommand =
+  command;
+
+
+ if(activeButton)
+ {
+  activeButton.classList.remove(
+   "active"
+  );
+ }
+
+
+ activeButton =
+  button;
+
+
+ if(activeButton)
+ {
+  activeButton.classList.add(
+   "active"
+  );
+ }
+
+
+ sendDrive(
+  command
+ );
+
+
+ driveTimer =
+  setInterval(
+   function()
+   {
+    sendDrive(
+     currentDriveCommand
     );
+   },
 
-
-    currentCommand =
-        command;
-
-
-    if(activeButton)
-    {
-        activeButton
-            .classList
-            .remove(
-                "on"
-            );
-    }
-
-
-    activeButton =
-        button
-        ||
-        null;
-
-
-    if(activeButton)
-    {
-        activeButton
-            .classList
-            .add(
-                "on"
-            );
-    }
-
-
-    send(
-        "D:"
-        +
-        command
-    );
-
-
-    /*
-        WebSocket heartbeat only while moving.
-    */
-
-    driveTimer =
-        setInterval(
-            function()
-            {
-                send(
-                    "D:"
-                    +
-                    currentCommand
-                );
-            },
-
-            100
-        );
+   websocketReady()
+   ?
+   120
+   :
+   200
+  );
 }
 
 
-function stopLocal()
+function stopDrive()
 {
-    clearInterval(
-        driveTimer
-    );
+ clearInterval(
+  driveTimer
+ );
 
 
-    driveTimer =
-        null;
+ driveTimer =
+  null;
 
 
-    currentCommand =
-        "S";
+ currentDriveCommand =
+  "S";
 
 
-    if(activeButton)
-    {
-        activeButton
-            .classList
-            .remove(
-                "on"
-            );
-    }
+ if(activeButton)
+ {
+  activeButton.classList.remove(
+   "active"
+  );
+ }
 
 
-    activeButton =
-        null;
+ activeButton =
+  null;
 
 
-    send(
-        "D:S"
-    );
+ sendDrive(
+  "S"
+ );
 }
 
 
-// =====================================================================
-// DIRECTION BUTTONS
-// =====================================================================
-
 document
-    .querySelectorAll(
-        ".drive[data-c]"
-    )
-    .forEach(
-        function(button)
-        {
-            button
-                .addEventListener(
-                    "pointerdown",
+.querySelectorAll(
+ ".driveButton[data-drive]"
+)
+.forEach(
+ function(button)
+ {
+  button.addEventListener(
+   "pointerdown",
 
-                    function(event)
-                    {
-                        event.preventDefault();
+   function(event)
+   {
+    event.preventDefault();
 
 
-                        drive(
-                            button.dataset.c,
-                            button
-                        );
-                    }
-                );
-        }
+    startDrive(
+     button.dataset.drive,
+     button
     );
-
-
-window.addEventListener(
-    "pointerup",
-    stopLocal
+   }
+  );
+ }
 );
 
 
 window.addEventListener(
-    "pointercancel",
-    stopLocal
+ "pointerup",
+ stopDrive
 );
 
 
-// =====================================================================
-// STOP
-// =====================================================================
-
-document
-    .getElementById(
-        "stop"
-    )
-    .addEventListener(
-        "pointerdown",
-
-        function(event)
-        {
-            event.preventDefault();
-
-            stopLocal();
-        }
-    );
+window.addEventListener(
+ "pointercancel",
+ stopDrive
+);
 
 
-// =====================================================================
-// EMERGENCY STOP
-// =====================================================================
+ui.stop.addEventListener(
+ "pointerdown",
 
-document
-    .getElementById(
-        "estop"
-    )
-    .addEventListener(
-        "pointerdown",
+ function(event)
+ {
+  event.preventDefault();
 
-        function(event)
-        {
-            event.preventDefault();
+  stopDrive();
+ }
+);
 
 
-            stopLocal();
+ui.emergency.addEventListener(
+ "pointerdown",
+
+ function(event)
+ {
+  event.preventDefault();
 
 
-            send(
-                "X"
-            );
+  stopDrive();
 
 
-            if(
-                navigator.vibrate
-            )
-            {
-                navigator.vibrate(
-                    40
-                );
-            }
-        }
-    );
+  if(websocketReady())
+  {
+   ws.send(
+    "X"
+   );
+  }
+
+  else
+  {
+   fetch(
+    "/api/stop",
+    {
+     cache:"no-store"
+    }
+   ).catch(
+    function(){}
+   );
+  }
 
 
-// =====================================================================
+  if(navigator.vibrate)
+  {
+   navigator.vibrate(
+    40
+   );
+  }
+ }
+);
+
+
+// ==================================================================
 // SPEED
-// =====================================================================
+// ==================================================================
 
-const speedSlider =
-    document.getElementById(
-        "speed"
-    );
+ui.speedSlider.addEventListener(
+ "input",
 
+ function()
+ {
+  cfg.speed =
+   Number(
+    ui.speedSlider.value
+   );
 
-const speedText =
-    document.getElementById(
-        "speedText"
-    );
 
+  ui.speedNumber.textContent =
+   cfg.speed;
 
-speedSlider
-    .addEventListener(
-        "input",
 
-        function()
-        {
-            cfg.speed =
-                Number(
-                    speedSlider.value
-                );
+  saveLocalConfig();
 
 
-            speedText.textContent =
-                cfg.speed;
-
-
-            save();
-
-
-            send(
-                "S:"
-                +
-                cfg.speed
-            );
-        }
-    );
-
-
-// =====================================================================
-// ECO / SPORT
-// =====================================================================
-
-function updateModeButtons()
-{
-    document
-        .getElementById(
-            "eco"
-        )
-        .classList
-        .toggle(
-            "selected",
-            cfg.eco
-        );
-
-
-    document
-        .getElementById(
-            "sport"
-        )
-        .classList
-        .toggle(
-            "selected",
-            !cfg.eco
-        );
-}
-
-
-document
-    .getElementById(
-        "eco"
-    )
-    .onclick =
-        function()
-        {
-            cfg.eco =
-                true;
-
-
-            save();
-
-            updateModeButtons();
-
-            sendConfig();
-        };
-
-
-document
-    .getElementById(
-        "sport"
-    )
-    .onclick =
-        function()
-        {
-            cfg.eco =
-                false;
-
-
-            save();
-
-            updateModeButtons();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// SETTINGS OPEN / CLOSE
-// =====================================================================
-
-const overlay =
-    document.getElementById(
-        "overlay"
-    );
-
-
-document
-    .getElementById(
-        "gear"
-    )
-    .onclick =
-        function()
-        {
-            stopLocal();
-
-
-            overlay
-                .classList
-                .add(
-                    "show"
-                );
-        };
-
-
-document
-    .getElementById(
-        "close"
-    )
-    .onclick =
-        function()
-        {
-            overlay
-                .classList
-                .remove(
-                    "show"
-                );
-        };
-
-
-// =====================================================================
-// UI SETTINGS
-// =====================================================================
-
-function updateUI()
-{
-    speedSlider.value =
-        cfg.speed;
-
-
-    speedText.textContent =
-        cfg.speed;
-
-
-    document
-        .getElementById(
-            "turn"
-        )
-        .value =
-        cfg.turn;
-
-
-    document
-        .getElementById(
-            "turnText"
-        )
-        .textContent =
-        cfg.turn
-        +
-        "%";
-
-
-    document
-        .getElementById(
-            "ramp"
-        )
-        .value =
-        cfg.ramp;
-
-
-    document
-        .getElementById(
-            "rampText"
-        )
-        .textContent =
-        cfg.ramp;
-
-
-    document
-        .getElementById(
-            "leftTrim"
-        )
-        .value =
-        cfg.leftTrim;
-
-
-    document
-        .getElementById(
-            "leftText"
-        )
-        .textContent =
-        cfg.leftTrim
-        +
-        "%";
-
-
-    document
-        .getElementById(
-            "rightTrim"
-        )
-        .value =
-        cfg.rightTrim;
-
-
-    document
-        .getElementById(
-            "rightText"
-        )
-        .textContent =
-        cfg.rightTrim
-        +
-        "%";
-
-
-    document
-        .getElementById(
-            "steering"
-        )
-        .value =
-        cfg.steering;
-
-
-    document
-        .getElementById(
-            "swap"
-        )
-        .checked =
-        cfg.swap;
-
-
-    document
-        .getElementById(
-            "ecoLimit"
-        )
-        .value =
-        cfg.ecoLimit;
-
-
-    document
-        .getElementById(
-            "ecoLimitText"
-        )
-        .textContent =
-        cfg.ecoLimit
-        +
-        "%";
-
-
-    document
-        .getElementById(
-            "wifiPower"
-        )
-        .value =
-        cfg.wifiPower;
-
-
-    updateModeButtons();
-}
-
-
-// =====================================================================
-// TURN
-// =====================================================================
-
-document
-    .getElementById(
-        "turn"
-    )
-    .oninput =
-        function(event)
-        {
-            cfg.turn =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            updateUI();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// ACCELERATION
-// =====================================================================
-
-document
-    .getElementById(
-        "ramp"
-    )
-    .oninput =
-        function(event)
-        {
-            cfg.ramp =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            updateUI();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// LEFT TRIM
-// =====================================================================
-
-document
-    .getElementById(
-        "leftTrim"
-    )
-    .oninput =
-        function(event)
-        {
-            cfg.leftTrim =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            updateUI();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// RIGHT TRIM
-// =====================================================================
-
-document
-    .getElementById(
-        "rightTrim"
-    )
-    .oninput =
-        function(event)
-        {
-            cfg.rightTrim =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            updateUI();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// STEERING STYLE
-// =====================================================================
-
-document
-    .getElementById(
-        "steering"
-    )
-    .onchange =
-        function(event)
-        {
-            stopLocal();
-
-
-            cfg.steering =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// SWAP LEFT / RIGHT
-// =====================================================================
-
-document
-    .getElementById(
-        "swap"
-    )
-    .onchange =
-        function(event)
-        {
-            stopLocal();
-
-
-            cfg.swap =
-                event.target.checked;
-
-
-            save();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// ECO LIMIT
-// =====================================================================
-
-document
-    .getElementById(
-        "ecoLimit"
-    )
-    .oninput =
-        function(event)
-        {
-            cfg.ecoLimit =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            updateUI();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// WIFI TX POWER
-// =====================================================================
-
-document
-    .getElementById(
-        "wifiPower"
-    )
-    .onchange =
-        function(event)
-        {
-            cfg.wifiPower =
-                Number(
-                    event.target.value
-                );
-
-
-            save();
-
-            sendConfig();
-        };
-
-
-// =====================================================================
-// WIFI CHANNEL
-// =====================================================================
-
-document
-    .getElementById(
-        "applyChannel"
-    )
-    .addEventListener(
-        "click",
-
-        function()
-        {
-            stopLocal();
-
-
-            const requestedChannel =
-                Number(
-                    document
-                        .getElementById(
-                            "wifiChannel"
-                        )
-                        .value
-                );
-
-
-            if(
-                   requestedChannel !== 1
-                && requestedChannel !== 6
-                && requestedChannel !== 11
-            )
-            {
-                return;
-            }
-
-
-            document
-                .getElementById(
-                    "currentChannel"
-                )
-                .textContent =
-                "Preparing Channel "
-                +
-                requestedChannel
-                +
-                "...";
-
-
-            send(
-                "W:"
-                +
-                requestedChannel
-            );
-        }
-    );
-
-
-// =====================================================================
-// PING
-// =====================================================================
-
-setInterval(
-    function()
-    {
-        if(
-            ws
-            &&
-            ws.readyState
-            ===
-            WebSocket.OPEN
-        )
-        {
-            send(
-                "P:"
-                +
-                Date.now()
-            );
-        }
-    },
-
-    1500
+  sendSpeed(
+   cfg.speed
+  );
+ }
 );
 
 
-// =====================================================================
-// TIME FORMAT
-// =====================================================================
+// ==================================================================
+// ECO / SPORT
+// ==================================================================
 
-function formatTime(seconds)
+ui.eco.addEventListener(
+ "click",
+
+ function()
+ {
+  cfg.eco =
+   true;
+
+
+  saveLocalConfig();
+
+
+  applyLocalUI();
+
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.sport.addEventListener(
+ "click",
+
+ function()
+ {
+  cfg.eco =
+   false;
+
+
+  saveLocalConfig();
+
+
+  applyLocalUI();
+
+
+  sendRuntimeConfig();
+ }
+);
+
+
+// ==================================================================
+// OVERLAYS
+// ==================================================================
+
+function openWifiPanel()
 {
-    if(seconds < 60)
-    {
-        return seconds
-        +
-        "s";
-    }
+ stopDrive();
 
 
-    const minutes =
-        Math.floor(
-            seconds / 60
-        );
+ ui.wifiOverlay.classList.add(
+  "show"
+ );
 
 
-    if(minutes < 60)
-    {
-        return minutes
-        +
-        "m";
-    }
-
-
-    return (
-        Math.floor(
-            minutes / 60
-        )
-        +
-        "h"
-    );
+ refreshHomeStatus();
 }
 
 
-// =====================================================================
+ui.wifiMain.addEventListener(
+ "click",
+ openWifiPanel
+);
+
+
+ui.wifiSide.addEventListener(
+ "click",
+ openWifiPanel
+);
+
+
+ui.wifiClose.addEventListener(
+ "click",
+
+ function()
+ {
+  ui.wifiOverlay.classList.remove(
+   "show"
+  );
+ }
+);
+
+
+ui.settingsMain.addEventListener(
+ "click",
+
+ function()
+ {
+  stopDrive();
+
+
+  ui.settingsOverlay.classList.add(
+   "show"
+  );
+ }
+);
+
+
+ui.settingsClose.addEventListener(
+ "click",
+
+ function()
+ {
+  ui.settingsOverlay.classList.remove(
+   "show"
+  );
+ }
+);
+
+
+// ==================================================================
+// CAR SETTINGS
+// ==================================================================
+
+ui.turn.addEventListener(
+ "input",
+
+ function()
+ {
+  cfg.turn =
+   Number(
+    ui.turn.value
+   );
+
+
+  saveLocalConfig();
+
+  applyLocalUI();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.ramp.addEventListener(
+ "input",
+
+ function()
+ {
+  cfg.ramp =
+   Number(
+    ui.ramp.value
+   );
+
+
+  saveLocalConfig();
+
+  applyLocalUI();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.leftTrim.addEventListener(
+ "input",
+
+ function()
+ {
+  cfg.leftTrim =
+   Number(
+    ui.leftTrim.value
+   );
+
+
+  saveLocalConfig();
+
+  applyLocalUI();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.rightTrim.addEventListener(
+ "input",
+
+ function()
+ {
+  cfg.rightTrim =
+   Number(
+    ui.rightTrim.value
+   );
+
+
+  saveLocalConfig();
+
+  applyLocalUI();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.ecoLimit.addEventListener(
+ "input",
+
+ function()
+ {
+  cfg.ecoLimit =
+   Number(
+    ui.ecoLimit.value
+   );
+
+
+  saveLocalConfig();
+
+  applyLocalUI();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.steering.addEventListener(
+ "change",
+
+ function()
+ {
+  stopDrive();
+
+
+  cfg.steering =
+   Number(
+    ui.steering.value
+   );
+
+
+  saveLocalConfig();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+ui.swap.addEventListener(
+ "change",
+
+ function()
+ {
+  stopDrive();
+
+
+  cfg.swap =
+   ui.swap.checked;
+
+
+  saveLocalConfig();
+
+  sendRuntimeConfig();
+ }
+);
+
+
+// ==================================================================
+// CHANNEL
+// ==================================================================
+
+ui.applyChannel.addEventListener(
+ "click",
+
+ function()
+ {
+  stopDrive();
+
+
+  const value =
+   Number(
+    ui.channelSelect.value
+   );
+
+
+  ui.channelMessage.textContent =
+   "Applying channel...";
+
+
+  if(websocketReady())
+  {
+   ws.send(
+    "W:"
+    +
+    value
+   );
+  }
+
+  else
+  {
+   fetch(
+    "/api/channel?v="
+    +
+    value,
+
+    {
+     cache:"no-store"
+    }
+
+   ).catch(
+    function(){}
+   );
+  }
+ }
+);
+
+
+// ==================================================================
+// HOME WIFI STATUS
+// ==================================================================
+
+async function refreshHomeStatus()
+{
+ try
+ {
+  const response =
+   await fetch(
+    "/api/wifi/status",
+
+    {
+     cache:"no-store"
+    }
+   );
+
+
+  const data =
+   await response.json();
+
+
+  if(data.connected)
+  {
+   ui.homeStatus.textContent =
+    "CONNECTED";
+
+
+   ui.homeStatus.className =
+    "good";
+
+
+   ui.homeMessage.textContent =
+    data.message;
+
+
+   ui.homeDetails.innerHTML =
+    "SSID: "
+    +
+    escapeHTML(data.ssid)
+    +
+    "<br>"
+    +
+    "IP: "
+    +
+    escapeHTML(data.ip)
+    +
+    "<br>"
+    +
+    "Signal: "
+    +
+    data.rssi
+    +
+    " dBm"
+    +
+    "<br>"
+    +
+    "Channel: "
+    +
+    data.channel;
+
+
+   ui.homeAddressHint.innerHTML =
+    "Open <b>http://rccar.local</b> or <b>http://"
+    +
+    escapeHTML(data.ip)
+    +
+    "</b> from devices on the same Home WiFi.";
+  }
+
+  else
+  {
+   ui.homeStatus.textContent =
+    data.testing
+    ?
+    "CONNECTING..."
+    :
+    (
+     data.configured
+     ?
+     "DISCONNECTED"
+     :
+     "NOT CONFIGURED"
+    );
+
+
+   ui.homeStatus.className =
+    data.testing
+    ?
+    ""
+    :
+    (
+     data.configured
+     ?
+     "bad"
+     :
+     ""
+    );
+
+
+   ui.homeMessage.textContent =
+    data.message;
+
+
+   ui.homeDetails.innerHTML =
+    data.configured
+    ?
+    (
+     "Saved SSID: "
+     +
+     escapeHTML(data.ssid)
+    )
+    :
+    "No Home WiFi saved.";
+
+
+   ui.homeAddressHint.textContent =
+    "rccar.local becomes available after Home WiFi successfully connects.";
+  }
+ }
+
+ catch(error)
+ {
+  ui.homeStatus.textContent =
+   "STATUS ERROR";
+ }
+}
+
+
+// ==================================================================
+// WIFI SCAN
+// ==================================================================
+
+ui.scan.addEventListener(
+ "click",
+
+ async function()
+ {
+  stopDrive();
+
+
+  ui.networkList.innerHTML =
+   '<div class="hint">Scanning WiFi networks...</div>';
+
+
+  ui.scan.disabled =
+   true;
+
+
+  try
+  {
+   const response =
+    await fetch(
+     "/api/wifi/scan",
+
+     {
+      cache:"no-store"
+     }
+    );
+
+
+   const networks =
+    await response.json();
+
+
+   ui.networkList.innerHTML =
+    "";
+
+
+   networks.forEach(
+    function(network)
+    {
+     const button =
+      document.createElement(
+       "button"
+      );
+
+
+     button.className =
+      "networkItem";
+
+
+     button.textContent =
+      network.ssid
+      +
+      " • "
+      +
+      network.rssi
+      +
+      " dBm"
+      +
+      " • CH"
+      +
+      network.channel
+      +
+      (
+       network.open
+       ?
+       " • OPEN"
+       :
+       " • 🔒"
+      );
+
+
+     button.addEventListener(
+      "click",
+
+      function()
+      {
+       ui.ssid.value =
+        network.ssid;
+
+
+       ui.networkList.innerHTML =
+        '<div class="hint">Selected: '
+        +
+        escapeHTML(network.ssid)
+        +
+        '</div>';
+      }
+     );
+
+
+     ui.networkList.appendChild(
+      button
+     );
+    }
+   );
+
+
+   if(networks.length === 0)
+   {
+    ui.networkList.innerHTML =
+     '<div class="hint">No networks found.</div>';
+   }
+  }
+
+  catch(error)
+  {
+   ui.networkList.innerHTML =
+    '<div class="hint">Scan failed. You can still enter SSID manually.</div>';
+  }
+
+
+  ui.scan.disabled =
+   false;
+ }
+);
+
+
+// ==================================================================
+// SHOW PASSWORD
+// ==================================================================
+
+ui.showPassword.addEventListener(
+ "change",
+
+ function()
+ {
+  ui.password.type =
+   ui.showPassword.checked
+   ?
+   "text"
+   :
+   "password";
+ }
+);
+
+
+// ==================================================================
+// CONNECT HOME WIFI
+// ==================================================================
+
+ui.connectWifi.addEventListener(
+ "click",
+
+ async function()
+ {
+  stopDrive();
+
+
+  const ssid =
+   ui.ssid.value.trim();
+
+
+  const password =
+   ui.password.value;
+
+
+  if(!ssid)
+  {
+   ui.homeMessage.textContent =
+    "Enter a WiFi name / SSID.";
+
+   return;
+  }
+
+
+  if(
+   password.length > 0
+   &&
+   password.length < 8
+  )
+  {
+   ui.homeMessage.textContent =
+    "Password must normally be at least 8 characters. Leave it blank only for an open network.";
+
+   return;
+  }
+
+
+  ui.connectWifi.disabled =
+   true;
+
+
+  ui.homeMessage.textContent =
+   "Sending credentials...";
+
+
+  const data =
+   new URLSearchParams();
+
+
+  data.set(
+   "ssid",
+   ssid
+  );
+
+
+  data.set(
+   "pass",
+   password
+  );
+
+
+  try
+  {
+   const response =
+    await fetch(
+     "/api/wifi/connect",
+
+     {
+      method:"POST",
+
+      headers:
+      {
+       "Content-Type":
+        "application/x-www-form-urlencoded"
+      },
+
+      body:
+       data.toString()
+     }
+    );
+
+
+   ui.homeMessage.textContent =
+    await response.text();
+
+
+   /*
+      The AP may briefly move to the
+      router channel.
+
+      Browser/WS automatically reconnects.
+   */
+
+   setTimeout(
+    refreshHomeStatus,
+    1500
+   );
+
+
+   setTimeout(
+    refreshHomeStatus,
+    5000
+   );
+  }
+
+  catch(error)
+  {
+   ui.homeMessage.textContent =
+    "Connection request was interrupted. RC_Car recovery WiFi should still remain available.";
+  }
+
+
+  ui.connectWifi.disabled =
+   false;
+ }
+);
+
+
+// ==================================================================
+// FORGET WIFI
+// ==================================================================
+
+ui.forgetWifi.addEventListener(
+ "click",
+
+ async function()
+ {
+  stopDrive();
+
+
+  if(
+   !confirm(
+    "Forget saved Home WiFi? RC_Car direct WiFi will remain available."
+   )
+  )
+  {
+   return;
+  }
+
+
+  try
+  {
+   await fetch(
+    "/api/wifi/forget",
+
+    {
+     method:"POST"
+    }
+   );
+
+
+   ui.ssid.value =
+    "";
+
+
+   ui.password.value =
+    "";
+
+
+   ui.homeMessage.textContent =
+    "Forgetting Home WiFi...";
+
+
+   setTimeout(
+    refreshHomeStatus,
+    1200
+   );
+  }
+
+  catch(error)
+  {
+  }
+ }
+);
+
+
+// ==================================================================
+// PING
+// ==================================================================
+
+async function measureLatency()
+{
+ const start =
+  Date.now();
+
+
+ if(websocketReady())
+ {
+  ws.send(
+   "P:"
+   +
+   start
+  );
+
+
+  return;
+ }
+
+
+ try
+ {
+  await fetch(
+   "/api/ping?t="
+   +
+   start,
+
+   {
+    cache:"no-store"
+   }
+  );
+
+
+  ui.latency.textContent =
+   (
+    Date.now()
+    -
+    start
+   )
+   +
+   "ms";
+ }
+
+ catch(error)
+ {
+ }
+}
+
+
+// ==================================================================
+// HTML ESCAPE
+// ==================================================================
+
+function escapeHTML(text)
+{
+ const div =
+  document.createElement(
+   "div"
+  );
+
+
+ div.textContent =
+  text;
+
+
+ return div.innerHTML;
+}
+
+
+// ==================================================================
 // SAFETY EVENTS
-// =====================================================================
+// ==================================================================
 
 document.addEventListener(
-    "visibilitychange",
+ "visibilitychange",
 
-    function()
-    {
-        if(document.hidden)
-        {
-            stopLocal();
-        }
-    }
+ function()
+ {
+  if(document.hidden)
+  {
+   stopDrive();
+  }
+ }
 );
 
 
 window.addEventListener(
-    "pagehide",
-    stopLocal
+ "pagehide",
+ stopDrive
 );
 
 
 window.addEventListener(
-    "blur",
-    stopLocal
+ "blur",
+ stopDrive
 );
 
 
 window.addEventListener(
-    "contextmenu",
+ "contextmenu",
 
-    function(event)
-    {
-        event.preventDefault();
-    }
+ function(event)
+ {
+  event.preventDefault();
+ }
 );
 
 
-// =====================================================================
+// ==================================================================
 // START
-// =====================================================================
+// ==================================================================
 
-updateUI();
+applyLocalUI();
 
-connect();
+
+probeHTTP();
+
+
+connectWebSocket();
+
+
+refreshHomeStatus();
+
+
+setInterval(
+ measureLatency,
+ 1800
+);
+
+
+setInterval(
+ probeHTTP,
+ 3500
+);
+
+
+setInterval(
+ refreshHomeStatus,
+ 5000
+);
 
 </script>
 
@@ -3966,7 +5225,7 @@ connect();
 
 
 // =====================================================================
-// HTTP ROOT
+// WEB ROOT
 // =====================================================================
 
 void handleRoot()
@@ -3986,13 +5245,1033 @@ void handleRoot()
   server.send_P(
     200,
     "text/html",
-    INDEX_HTML
+    PAGE
   );
 }
 
 
 // =====================================================================
-// WEBSOCKET EVENT
+// BUILD GENERAL STATE JSON
+// =====================================================================
+
+String buildStateJSON()
+{
+  bool homeConnected =
+    (
+      WiFi.status()
+      ==
+      WL_CONNECTED
+    );
+
+
+  int actualChannel =
+    homeConnected
+    ?
+    WiFi.channel()
+    :
+    apChannel;
+
+
+  String json;
+
+
+  json.reserve(
+    160
+  );
+
+
+  json +=
+    "{";
+
+
+  json +=
+    "\"clients\":";
+
+
+  json +=
+    String(
+      WiFi.softAPgetStationNum()
+    );
+
+
+  json +=
+    ",\"channel\":";
+
+
+  json +=
+    String(
+      actualChannel
+    );
+
+
+  json +=
+    ",\"savedChannel\":";
+
+
+  json +=
+    String(
+      apChannel
+    );
+
+
+  json +=
+    ",\"homeConnected\":";
+
+
+  json +=
+    (
+      homeConnected
+      ?
+      "true"
+      :
+      "false"
+    );
+
+
+  json +=
+    ",\"heap\":";
+
+
+  json +=
+    String(
+      ESP.getFreeHeap()
+    );
+
+
+  json +=
+    "}";
+
+
+  return json;
+}
+
+
+// =====================================================================
+// STATE API
+// =====================================================================
+
+void handleState()
+{
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+
+  server.send(
+    200,
+    "application/json",
+    buildStateJSON()
+  );
+}
+
+
+// =====================================================================
+// HTTP DRIVE FALLBACK
+// =====================================================================
+
+void handleDriveHTTP()
+{
+  if(
+    !server.hasArg("c")
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing command"
+    );
+
+
+    return;
+  }
+
+
+  String value =
+    server.arg("c");
+
+
+  if(
+    value.length()
+    ==
+    0
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Invalid command"
+    );
+
+
+    return;
+  }
+
+
+  driveCommand(
+    value.charAt(0)
+  );
+
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+}
+
+
+// =====================================================================
+// HTTP SPEED
+// =====================================================================
+
+void handleSpeedHTTP()
+{
+  if(
+    server.hasArg("v")
+  )
+  {
+    speedPercent =
+      constrain(
+        server.arg("v").toInt(),
+        20,
+        100
+      );
+
+
+    if(
+      activeCommand
+      !=
+      'S'
+    )
+    {
+      calculateDrive(
+        activeCommand
+      );
+    }
+  }
+
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+}
+
+
+// =====================================================================
+// RUNTIME CONFIG APPLY
+// =====================================================================
+
+void applyRuntimeConfig(
+  int turn,
+  int lt,
+  int rt,
+  int ramp,
+  int steering,
+  int swap,
+  int eco,
+  int limit
+)
+{
+  turnStrength =
+    constrain(
+      turn,
+      30,
+      100
+    );
+
+
+  leftTrim =
+    constrain(
+      lt,
+      70,
+      110
+    );
+
+
+  rightTrim =
+    constrain(
+      rt,
+      70,
+      110
+    );
+
+
+  rampStep =
+    constrain(
+      ramp,
+      4,
+      30
+    );
+
+
+  steeringMode =
+    constrain(
+      steering,
+      0,
+      1
+    );
+
+
+  swapSteering =
+    (
+      swap
+      !=
+      0
+    );
+
+
+  ecoMode =
+    (
+      eco
+      !=
+      0
+    );
+
+
+  ecoSpeedLimit =
+    constrain(
+      limit,
+      50,
+      100
+    );
+
+
+  if(
+    activeCommand
+    !=
+    'S'
+  )
+  {
+    calculateDrive(
+      activeCommand
+    );
+  }
+}
+
+
+// =====================================================================
+// HTTP CONFIG FALLBACK
+// =====================================================================
+
+void handleConfigHTTP()
+{
+  if(
+       !server.hasArg("turn")
+    || !server.hasArg("lt")
+    || !server.hasArg("rt")
+    || !server.hasArg("ramp")
+    || !server.hasArg("steer")
+    || !server.hasArg("swap")
+    || !server.hasArg("eco")
+    || !server.hasArg("limit")
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing config"
+    );
+
+
+    return;
+  }
+
+
+  applyRuntimeConfig(
+
+    server.arg("turn").toInt(),
+
+    server.arg("lt").toInt(),
+
+    server.arg("rt").toInt(),
+
+    server.arg("ramp").toInt(),
+
+    server.arg("steer").toInt(),
+
+    server.arg("swap").toInt(),
+
+    server.arg("eco").toInt(),
+
+    server.arg("limit").toInt()
+
+  );
+
+
+  server.send(
+    200,
+    "text/plain",
+    "OK"
+  );
+}
+
+
+// =====================================================================
+// HTTP STOP
+// =====================================================================
+
+void handleStopHTTP()
+{
+  stopCar();
+
+
+  server.send(
+    200,
+    "text/plain",
+    "STOPPED"
+  );
+}
+
+
+// =====================================================================
+// HTTP PING
+// =====================================================================
+
+void handlePing()
+{
+  if(
+    server.hasArg("t")
+  )
+  {
+    server.send(
+      200,
+      "text/plain",
+      server.arg("t")
+    );
+  }
+
+  else
+  {
+    server.send(
+      200,
+      "text/plain",
+      "PONG"
+    );
+  }
+}
+
+
+// =====================================================================
+// HOME WIFI STATUS
+// =====================================================================
+
+void handleHomeWiFiStatus()
+{
+  bool connected =
+    (
+      WiFi.status()
+      ==
+      WL_CONNECTED
+    );
+
+
+  String ssid;
+
+
+  if(connected)
+  {
+    ssid =
+      WiFi.SSID();
+  }
+
+
+  else if(
+    savedHomeWiFiExists()
+  )
+  {
+    ssid =
+      persistentConfig.homeSSID;
+  }
+
+
+  String json;
+
+
+  json.reserve(
+    320
+  );
+
+
+  json +=
+    "{";
+
+
+  json +=
+    "\"configured\":";
+
+
+  json +=
+    (
+      savedHomeWiFiExists()
+      ?
+      "true"
+      :
+      "false"
+    );
+
+
+  json +=
+    ",\"testing\":";
+
+
+  json +=
+    (
+      homeTestActive
+      ||
+      pendingHomeConnect
+      ?
+      "true"
+      :
+      "false"
+    );
+
+
+  json +=
+    ",\"connected\":";
+
+
+  json +=
+    (
+      connected
+      ?
+      "true"
+      :
+      "false"
+    );
+
+
+  json +=
+    ",\"ssid\":\"";
+
+
+  json +=
+    jsonEscape(
+      ssid
+    );
+
+
+  json +=
+    "\"";
+
+
+  json +=
+    ",\"ip\":\"";
+
+
+  if(connected)
+  {
+    json +=
+      WiFi.localIP().toString();
+  }
+
+
+  json +=
+    "\"";
+
+
+  json +=
+    ",\"rssi\":";
+
+
+  json +=
+    (
+      connected
+      ?
+      String(
+        WiFi.RSSI()
+      )
+      :
+      String(0)
+    );
+
+
+  json +=
+    ",\"channel\":";
+
+
+  json +=
+    String(
+      connected
+      ?
+      WiFi.channel()
+      :
+      apChannel
+    );
+
+
+  json +=
+    ",\"message\":\"";
+
+
+  json +=
+    jsonEscape(
+      homeStatusMessage
+    );
+
+
+  json +=
+    "\"";
+
+
+  json +=
+    "}";
+
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================================
+// WIFI SCAN
+// =====================================================================
+
+void handleWiFiScan()
+{
+  stopCar();
+
+
+  /*
+     Temporarily enable STA capability
+     so scanning works.
+
+     AP stays enabled.
+  */
+
+  if(
+    WiFi.getMode()
+    ==
+    WIFI_AP
+  )
+  {
+    WiFi.mode(
+      WIFI_AP_STA
+    );
+  }
+
+
+  int networkCount =
+    WiFi.scanNetworks(
+      false,
+      true
+    );
+
+
+  String json;
+
+
+  json.reserve(
+    1600
+  );
+
+
+  json +=
+    "[";
+
+
+  int added =
+    0;
+
+
+  if(
+    networkCount
+    >
+    0
+  )
+  {
+    for(
+      int i = 0;
+      i < networkCount && added < 15;
+      i++
+    )
+    {
+      String ssid =
+        WiFi.SSID(i);
+
+
+      if(
+        ssid.length()
+        ==
+        0
+      )
+      {
+        continue;
+      }
+
+
+      if(
+        added
+        >
+        0
+      )
+      {
+        json +=
+          ",";
+      }
+
+
+      json +=
+        "{";
+
+
+      json +=
+        "\"ssid\":\"";
+
+
+      json +=
+        jsonEscape(
+          ssid
+        );
+
+
+      json +=
+        "\"";
+
+
+      json +=
+        ",\"rssi\":";
+
+
+      json +=
+        String(
+          WiFi.RSSI(i)
+        );
+
+
+      json +=
+        ",\"channel\":";
+
+
+      json +=
+        String(
+          WiFi.channel(i)
+        );
+
+
+      json +=
+        ",\"open\":";
+
+
+      json +=
+        (
+          WiFi.encryptionType(i)
+          ==
+          ENC_TYPE_NONE
+          ?
+          "true"
+          :
+          "false"
+        );
+
+
+      json +=
+        "}";
+
+
+      added++;
+    }
+  }
+
+
+  json +=
+    "]";
+
+
+  WiFi.scanDelete();
+
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================================
+// REQUEST HOME WIFI CONNECTION
+// =====================================================================
+
+void handleHomeWiFiConnect()
+{
+  stopCar();
+
+
+  if(
+    !server.hasArg("ssid")
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing WiFi name"
+    );
+
+
+    return;
+  }
+
+
+  String ssid =
+    server.arg("ssid");
+
+
+  String password =
+    server.arg("pass");
+
+
+  ssid.trim();
+
+
+  if(
+    ssid.length() < 1
+    ||
+    ssid.length() > 32
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "WiFi name must be 1-32 characters"
+    );
+
+
+    return;
+  }
+
+
+  if(
+    password.length()
+    >
+    64
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Password is too long"
+    );
+
+
+    return;
+  }
+
+
+  if(
+    password.length() > 0
+    &&
+    password.length() < 8
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Password must be at least 8 characters, or blank for an open network"
+    );
+
+
+    return;
+  }
+
+
+  memset(
+    testSSID,
+    0,
+    sizeof(testSSID)
+  );
+
+
+  memset(
+    testPassword,
+    0,
+    sizeof(testPassword)
+  );
+
+
+  strncpy(
+    testSSID,
+    ssid.c_str(),
+    sizeof(testSSID)-1
+  );
+
+
+  strncpy(
+    testPassword,
+    password.c_str(),
+    sizeof(testPassword)-1
+  );
+
+
+  /*
+     Important:
+
+     Respond to browser FIRST.
+
+     Then start station connection after
+     800ms from loop().
+
+     This reduces the chance of losing
+     the HTTP acknowledgement when the
+     ESP radio moves to the router channel.
+  */
+
+  pendingHomeConnect =
+    true;
+
+
+  pendingHomeConnectAt =
+    millis()
+    +
+    800;
+
+
+  homeStatusMessage =
+    "Preparing Home WiFi connection...";
+
+
+  server.send(
+    200,
+    "text/plain",
+    "Credentials received. Testing connection now..."
+  );
+}
+
+
+// =====================================================================
+// FORGET HOME WIFI
+// =====================================================================
+
+void handleForgetHomeWiFi()
+{
+  stopCar();
+
+
+  /*
+     Same idea:
+
+     reply first,
+     change radio state afterwards.
+  */
+
+  pendingForgetHome =
+    true;
+
+
+  pendingForgetAt =
+    millis()
+    +
+    500;
+
+
+  server.send(
+    200,
+    "text/plain",
+    "Forgetting Home WiFi..."
+  );
+}
+
+
+// =====================================================================
+// CHANNEL API
+// =====================================================================
+
+void handleChannelHTTP()
+{
+  if(
+    WiFi.status()
+    ==
+    WL_CONNECTED
+  )
+  {
+    server.send(
+      409,
+      "text/plain",
+      "Home router controls the channel"
+    );
+
+
+    return;
+  }
+
+
+  if(
+    !server.hasArg("v")
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Missing channel"
+    );
+
+
+    return;
+  }
+
+
+  int channel =
+    server.arg("v").toInt();
+
+
+  if(
+       channel != 1
+    && channel != 6
+    && channel != 11
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Invalid channel"
+    );
+
+
+    return;
+  }
+
+
+  requestedChannel =
+    channel;
+
+
+  requestedChannelAt =
+    millis()
+    +
+    600;
+
+
+  pendingChannelChange =
+    true;
+
+
+  server.send(
+    200,
+    "text/plain",
+    "Changing channel..."
+  );
+}
+
+
+// =====================================================================
+// WEBSOCKET
 // =====================================================================
 
 void webSocketEvent(
@@ -4002,59 +6281,59 @@ void webSocketEvent(
   size_t length
 )
 {
-
-  // -------------------------------------------------------------------
-  // CONNECTED
-  // -------------------------------------------------------------------
-
-  if (type == WStype_CONNECTED)
+  if(
+    type
+    ==
+    WStype_CONNECTED
+  )
   {
     webSocket.sendTXT(
       client,
       "READY"
     );
 
+
     return;
   }
 
 
-  // -------------------------------------------------------------------
-  // DISCONNECTED
-  // -------------------------------------------------------------------
-
-  if (type == WStype_DISCONNECTED)
+  if(
+    type
+    ==
+    WStype_DISCONNECTED
+  )
   {
     /*
-        If controlling phone disappears,
-        stop motors immediately.
+       No immediate stop here because browsers
+       can reconnect momentarily during AP/STA
+       channel transitions.
+
+       CONTROL_TIMEOUT is the independent
+       motor failsafe.
     */
-
-    if (
-      controllerClient
-      ==
-      client
-    )
-    {
-      stopCar();
-
-      controllerClient = -1;
-    }
-
 
     return;
   }
 
 
-  // -------------------------------------------------------------------
-  // TEXT ONLY
-  // -------------------------------------------------------------------
-
-  if (type != WStype_TEXT)
+  if(
+    type
+    !=
+    WStype_TEXT
+  )
+  {
     return;
+  }
 
 
-  if (length == 0)
+  if(
+    length
+    ==
+    0
+  )
+  {
     return;
+  }
 
 
   char message[120];
@@ -4063,7 +6342,7 @@ void webSocketEvent(
   size_t copyLength =
     min(
       length,
-      sizeof(message) - 1
+      sizeof(message)-1
     );
 
 
@@ -4078,86 +6357,18 @@ void webSocketEvent(
     '\0';
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
   // DRIVE
-  //
-  // D:F
-  // D:B
-  // D:L
-  // etc.
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  if (
+  if(
     message[0] == 'D'
     &&
     message[1] == ':'
   )
   {
-    char command =
-      message[2];
-
-
-    if (
-      !validDriveCommand(
-        command
-      )
-    )
-    {
-      stopCar();
-
-      return;
-    }
-
-
-    /*
-        First client to actually drive
-        gets control ownership.
-    */
-
-    if (
-      command != 'S'
-      &&
-      controllerClient < 0
-    )
-    {
-      controllerClient =
-        client;
-    }
-
-
-    /*
-        Other phones cannot fight
-        over motor control.
-    */
-
-    if (
-      command != 'S'
-      &&
-      controllerClient
-      !=
-      client
-    )
-    {
-      return;
-    }
-
-
-    /*
-        STOP is always accepted.
-    */
-
-    if (command == 'S')
-    {
-      stopCar();
-
-      controllerClient = -1;
-
-      return;
-    }
-
-
     driveCommand(
-      command
+      message[2]
     );
 
 
@@ -4165,29 +6376,28 @@ void webSocketEvent(
   }
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
   // EMERGENCY STOP
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  if (
-    message[0] == 'X'
+  if(
+    message[0]
+    ==
+    'X'
   )
   {
     stopCar();
 
-    controllerClient = -1;
 
     return;
   }
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
   // SPEED
-  //
-  // S:70
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  if (
+  if(
     message[0] == 'S'
     &&
     message[1] == ':'
@@ -4196,14 +6406,14 @@ void webSocketEvent(
     speedPercent =
       constrain(
         atoi(
-          message + 2
+          message+2
         ),
         20,
         100
       );
 
 
-    if (
+    if(
       activeCommand
       !=
       'S'
@@ -4219,293 +6429,101 @@ void webSocketEvent(
   }
 
 
-  // -------------------------------------------------------------------
-  // CONFIGURATION
-  //
-  // C:
-  // turn,
-  // leftTrim,
-  // rightTrim,
-  // ramp,
-  // steering,
-  // swap,
-  // eco,
-  // ecoLimit,
-  // txPowerTenths
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // CONFIG
+  // -----------------------------------------------------------------
 
-  if (
+  if(
     message[0] == 'C'
     &&
     message[1] == ':'
   )
   {
     int turn;
+
     int lt;
+
     int rt;
+
     int ramp;
-    int steer;
+
+    int steering;
+
     int swap;
+
     int eco;
-    int ecoLimit;
-    int txPower;
+
+    int limit;
 
 
     int count =
       sscanf(
 
-        message + 2,
+        message+2,
 
-        "%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        "%d,%d,%d,%d,%d,%d,%d,%d",
 
         &turn,
+
         &lt,
+
         &rt,
+
         &ramp,
-        &steer,
+
+        &steering,
+
         &swap,
+
         &eco,
-        &ecoLimit,
-        &txPower
+
+        &limit
+
       );
 
 
-    if (count == 9)
-    {
-      turnStrength =
-        constrain(
-          turn,
-          30,
-          100
-        );
-
-
-      leftTrim =
-        constrain(
-          lt,
-          70,
-          110
-        );
-
-
-      rightTrim =
-        constrain(
-          rt,
-          70,
-          110
-        );
-
-
-      rampStep =
-        constrain(
-          ramp,
-          4,
-          30
-        );
-
-
-      steeringMode =
-        constrain(
-          steer,
-          0,
-          1
-        );
-
-
-      swapSteering =
-        swap != 0;
-
-
-      ecoMode =
-        eco != 0;
-
-
-      ecoSpeedLimit =
-        constrain(
-          ecoLimit,
-          50,
-          100
-        );
-
-
-      txPower =
-        constrain(
-          txPower,
-          0,
-          205
-        );
-
-
-      wifiTxPower =
-        txPower /
-        10.0f;
-
-
-      /*
-          Change radio output power
-          without restarting AP.
-      */
-
-      WiFi.setOutputPower(
-        wifiTxPower
-      );
-
-
-      if (
-        activeCommand
-        !=
-        'S'
-      )
-      {
-        calculateDrive(
-          activeCommand
-        );
-      }
-    }
-
-
-    return;
-  }
-
-
-  // -------------------------------------------------------------------
-  // WIFI CHANNEL CHANGE
-  //
-  // W:1
-  // W:6
-  // W:11
-  // -------------------------------------------------------------------
-
-  if (
-    message[0] == 'W'
-    &&
-    message[1] == ':'
-  )
-  {
-    int requested =
-      atoi(
-        message + 2
-      );
-
-
-    if (
-         requested != 1
-      && requested != 6
-      && requested != 11
-    )
-    {
-      webSocket.sendTXT(
-        client,
-        "CHANNEL_ERROR"
-      );
-
-      return;
-    }
-
-
-    /*
-        Already using this channel.
-    */
-
-    if (
-      requested
+    if(
+      count
       ==
-      apChannel
+      8
     )
     {
-      char reply[20];
+      applyRuntimeConfig(
 
+        turn,
 
-      snprintf(
-        reply,
-        sizeof(reply),
+        lt,
 
-        "CH:%d",
+        rt,
 
-        apChannel
+        ramp,
+
+        steering,
+
+        swap,
+
+        eco,
+
+        limit
+
       );
-
-
-      webSocket.sendTXT(
-        client,
-        reply
-      );
-
-
-      return;
     }
-
-
-    /*
-        Never change AP radio
-        while motors are moving.
-    */
-
-    stopCar();
-
-    controllerClient = -1;
-
-
-    pendingChannel =
-      requested;
-
-
-    /*
-        Wait 500ms before switching.
-
-        This lets WebSocket acknowledgement
-        reach the phone before AP disappears.
-    */
-
-    channelChangeAt =
-      millis()
-      +
-      500;
-
-
-    channelChangePending =
-      true;
-
-
-    char reply[30];
-
-
-    snprintf(
-      reply,
-      sizeof(reply),
-
-      "CHANGING:%d",
-
-      requested
-    );
-
-
-    webSocket.sendTXT(
-      client,
-      reply
-    );
 
 
     return;
   }
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
   // PING
-  //
-  // P:<timestamp>
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  if (
+  if(
     message[0] == 'P'
     &&
     message[1] == ':'
   )
   {
-    /*
-        Immediate echo.
-    */
-
     webSocket.sendTXT(
       client,
       message
@@ -4514,55 +6532,94 @@ void webSocketEvent(
 
     return;
   }
-}
 
 
-// =====================================================================
-// STATUS PUSH
-// =====================================================================
+  // -----------------------------------------------------------------
+  // CHANNEL
+  // -----------------------------------------------------------------
 
-void pushStatus()
-{
-  unsigned long now =
-    millis();
-
-
-  if (
-    now - lastStatusPush
-    <
-    2000
+  if(
+    message[0] == 'W'
+    &&
+    message[1] == ':'
   )
   {
+    int channel =
+      atoi(
+        message+2
+      );
+
+
+    if(
+      WiFi.status()
+      ==
+      WL_CONNECTED
+    )
+    {
+      char response[32];
+
+
+      snprintf(
+        response,
+        sizeof(response),
+        "CHANNEL_LOCKED:%d",
+        WiFi.channel()
+      );
+
+
+      webSocket.sendTXT(
+        client,
+        response
+      );
+
+
+      return;
+    }
+
+
+    if(
+         channel != 1
+      && channel != 6
+      && channel != 11
+    )
+    {
+      return;
+    }
+
+
+    requestedChannel =
+      channel;
+
+
+    requestedChannelAt =
+      millis()
+      +
+      600;
+
+
+    pendingChannelChange =
+      true;
+
+
+    char response[24];
+
+
+    snprintf(
+      response,
+      sizeof(response),
+      "CHANGING:%d",
+      channel
+    );
+
+
+    webSocket.sendTXT(
+      client,
+      response
+    );
+
+
     return;
   }
-
-
-  lastStatusPush =
-    now;
-
-
-  char message[100];
-
-
-  snprintf(
-    message,
-    sizeof(message),
-
-    "T:%u,%lu,%u,%u",
-
-    WiFi.softAPgetStationNum(),
-
-    now / 1000,
-
-    ESP.getFreeHeap(),
-
-    apChannel
-  );
-
-
-  webSocket.broadcastTXT(
-    message
-  );
 }
 
 
@@ -4572,138 +6629,261 @@ void pushStatus()
 
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(
+    115200
+  );
 
 
-  delay(100);
+  delay(
+    100
+  );
 
 
-  // -------------------------------------------------------------------
-  // LOAD SAVED WIFI CHANNEL
-  // -------------------------------------------------------------------
+  Serial.println();
 
-  loadWiFiChannel();
+  Serial.println(
+    "======================================"
+  );
+
+  Serial.println(
+    "       RC CAR PRO - BOOTING"
+  );
+
+  Serial.println(
+    "======================================"
+  );
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // LOAD SETTINGS
+  // -----------------------------------------------------------------
+
+  loadPersistentConfig();
+
+
+  // -----------------------------------------------------------------
   // MOTOR PINS
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
-  pinMode(IN1, OUTPUT);
-
-  pinMode(IN2, OUTPUT);
-
-  pinMode(IN3, OUTPUT);
-
-  pinMode(IN4, OUTPUT);
-
-  pinMode(ENA, OUTPUT);
-
-  pinMode(ENB, OUTPUT);
+  pinMode(
+    IN1,
+    OUTPUT
+  );
 
 
-  /*
-      Explicit PWM range.
+  pinMode(
+    IN2,
+    OUTPUT
+  );
 
-      0   = motors off
-      255 = full PWM
-  */
+
+  pinMode(
+    IN3,
+    OUTPUT
+  );
+
+
+  pinMode(
+    IN4,
+    OUTPUT
+  );
+
+
+  pinMode(
+    ENA,
+    OUTPUT
+  );
+
+
+  pinMode(
+    ENB,
+    OUTPUT
+  );
+
 
   analogWriteRange(
     255
   );
 
 
-  /*
-      1 kHz gives a good balance of:
-        motor control
-        CPU load
-        switching losses
-  */
-
   analogWriteFreq(
     1000
   );
 
 
-  /*
-      NEVER boot with motors active.
-  */
-
   stopCar();
 
 
-  // -------------------------------------------------------------------
-  // LOWER TCP LATENCY
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // WIFI BEHAVIOUR
+  // -----------------------------------------------------------------
+
+  WiFi.persistent(
+    false
+  );
+
 
   /*
-      Disable Nagle.
-
-      Small WebSocket commands should
-      leave immediately.
+     We manage reconnection ourselves so the
+     radio does not unexpectedly channel-hop
+     while the car is moving.
   */
+
+  WiFi.setAutoConnect(
+    false
+  );
+
+
+  WiFi.setAutoReconnect(
+    false
+  );
+
 
   WiFiClient::setDefaultNoDelay(
     true
   );
 
 
-  // -------------------------------------------------------------------
-  // CREATE AP
-  // -------------------------------------------------------------------
+  WiFi.hostname(
+    MDNS_HOST
+  );
+
+
+  // -----------------------------------------------------------------
+  // START AP
+  // -----------------------------------------------------------------
 
   bool apStarted =
     false;
 
 
-  for (
+  for(
     int attempt = 0;
     attempt < 3;
     attempt++
   )
   {
-    if (
-      createAccessPoint()
+    if(
+      startSoftAP(
+        savedHomeWiFiExists()
+      )
     )
     {
       apStarted =
         true;
 
+
       break;
     }
 
 
-    WiFi.softAPdisconnect(
-      true
+    delay(
+      100
     );
-
-
-    delay(50);
   }
 
 
-  /*
-      If WiFi stack is in a strange state,
-      restarting lets setup() try again.
-  */
-
-  if (!apStarted)
+  if(!apStarted)
   {
-    delay(100);
+    Serial.println(
+      "AP failed - rebooting"
+    );
+
+
+    delay(
+      300
+    );
+
 
     ESP.restart();
   }
 
 
-  // -------------------------------------------------------------------
-  // HTTP SERVER
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // WEB ROUTES
+  // -----------------------------------------------------------------
 
   server.on(
     "/",
     HTTP_GET,
     handleRoot
+  );
+
+
+  server.on(
+    "/api/state",
+    HTTP_GET,
+    handleState
+  );
+
+
+  server.on(
+    "/api/drive",
+    HTTP_GET,
+    handleDriveHTTP
+  );
+
+
+  server.on(
+    "/api/speed",
+    HTTP_GET,
+    handleSpeedHTTP
+  );
+
+
+  server.on(
+    "/api/config",
+    HTTP_GET,
+    handleConfigHTTP
+  );
+
+
+  server.on(
+    "/api/stop",
+    HTTP_GET,
+    handleStopHTTP
+  );
+
+
+  server.on(
+    "/api/ping",
+    HTTP_GET,
+    handlePing
+  );
+
+
+  server.on(
+    "/api/channel",
+    HTTP_GET,
+    handleChannelHTTP
+  );
+
+
+  server.on(
+    "/api/wifi/status",
+    HTTP_GET,
+    handleHomeWiFiStatus
+  );
+
+
+  server.on(
+    "/api/wifi/scan",
+    HTTP_GET,
+    handleWiFiScan
+  );
+
+
+  server.on(
+    "/api/wifi/connect",
+    HTTP_POST,
+    handleHomeWiFiConnect
+  );
+
+
+  server.on(
+    "/api/wifi/forget",
+    HTTP_POST,
+    handleForgetHomeWiFi
   );
 
 
@@ -4715,9 +6895,9 @@ void setup()
   server.begin();
 
 
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
   // WEBSOCKET
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
 
   webSocket.begin();
 
@@ -4727,22 +6907,48 @@ void setup()
   );
 
 
-  // -------------------------------------------------------------------
-  // SERIAL INFORMATION
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // SAVED HOME WIFI
+  // -----------------------------------------------------------------
 
-  Serial.println();
+  if(
+    savedHomeWiFiExists()
+  )
+  {
+    homeStatusMessage =
+      "Connecting saved Home WiFi...";
+
+
+    beginHomeWiFi(
+
+      persistentConfig.homeSSID,
+
+      persistentConfig.homePassword
+
+    );
+  }
+
+  else
+  {
+    /*
+       YOUR CURRENT CASE:
+
+       No Home WiFi is configured.
+
+       Stay AP-only.
+    */
+
+    homeStatusMessage =
+      "No Home WiFi configured. RC_Car direct mode active.";
+  }
+
+
+  // -----------------------------------------------------------------
+  // DEBUG
+  // -----------------------------------------------------------------
 
   Serial.println(
-    "======================================="
-  );
-
-  Serial.println(
-    "       RC CAR PRO READY"
-  );
-
-  Serial.println(
-    "======================================="
+    "RC_Car AP: READY"
   );
 
 
@@ -4750,14 +6956,16 @@ void setup()
     "SSID: "
   );
 
+
   Serial.println(
     AP_SSID
   );
 
 
   Serial.print(
-    "IP: "
+    "AP IP: "
   );
+
 
   Serial.println(
     WiFi.softAPIP()
@@ -4765,8 +6973,9 @@ void setup()
 
 
   Serial.print(
-    "WiFi Channel: "
+    "Preferred AP Channel: "
   );
+
 
   Serial.println(
     apChannel
@@ -4774,33 +6983,44 @@ void setup()
 
 
   Serial.print(
-    "WiFi TX power: "
-  );
-
-  Serial.print(
-    wifiTxPower
-  );
-
-  Serial.println(
-    " dBm"
+    "Home WiFi saved: "
   );
 
 
   Serial.println(
-    "Controller:"
+    savedHomeWiFiExists()
+    ?
+    "YES"
+    :
+    "NO"
   );
 
+
   Serial.println(
-    "http://192.168.4.1"
+    "HTTP: port 80"
   );
 
 
   Serial.println(
-    "======================================="
+    "WebSocket: port 81"
+  );
+
+
+  Serial.println(
+    "Open http://192.168.4.1"
+  );
+
+
+  Serial.println(
+    "======================================"
   );
 
 
   lastControlPacket =
+    millis();
+
+
+  lastSavedHomeAttempt =
     millis();
 }
 
@@ -4811,34 +7031,44 @@ void setup()
 
 void loop()
 {
-
-  // -------------------------------------------------------------------
-  // NETWORK
-  // -------------------------------------------------------------------
+  // HTTP
 
   server.handleClient();
+
+
+  // WebSocket
 
   webSocket.loop();
 
 
-  // -------------------------------------------------------------------
-  // MOTORS
-  // -------------------------------------------------------------------
+  // mDNS
 
-  updateMotorRamp();
+  if(
+    mdnsRunning
+    &&
+    MDNS.isRunning()
+  )
+  {
+    MDNS.update();
+  }
 
 
-  // -------------------------------------------------------------------
-  // MOTOR COMMUNICATION FAILSAFE
-  // -------------------------------------------------------------------
+  // Motors
 
-  if (
+  updateMotors();
+
+
+  // -----------------------------------------------------------------
+  // MOTOR FAILSAFE
+  // -----------------------------------------------------------------
+
+  if(
     activeCommand
     !=
     'S'
   )
   {
-    if (
+    if(
       millis()
       -
       lastControlPacket
@@ -4847,36 +7077,32 @@ void loop()
     )
     {
       stopCar();
-
-      controllerClient = -1;
     }
   }
 
 
-  // -------------------------------------------------------------------
-  // CHANGE CHANNEL IF REQUESTED
-  // -------------------------------------------------------------------
+  // -----------------------------------------------------------------
+  // NETWORK ACTIONS
+  // -----------------------------------------------------------------
 
-  changeWiFiChannelNow();
-
-
-  // -------------------------------------------------------------------
-  // KEEP ACCESS POINT ALIVE
-  // -------------------------------------------------------------------
-
-  checkAccessPoint();
+  startPendingHomeTest();
 
 
-  // -------------------------------------------------------------------
-  // STATUS
-  // -------------------------------------------------------------------
-
-  pushStatus();
+  processPendingForget();
 
 
-  // -------------------------------------------------------------------
-  // ESP8266 WIFI/WATCHDOG
-  // -------------------------------------------------------------------
+  manageHomeWiFi();
+
+
+  processChannelChange();
+
+
+  checkAccessPointHealth();
+
+
+  // -----------------------------------------------------------------
+  // ESP8266 WIFI / WATCHDOG
+  // -----------------------------------------------------------------
 
   yield();
 }
